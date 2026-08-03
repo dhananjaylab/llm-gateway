@@ -22,9 +22,16 @@ from functools import lru_cache
 from pathlib import Path
 
 import yaml
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 _DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "teams.yaml"
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# Load environment variables from the workspace .env file before any
+# provider settings are read. This allows the app to pick up Gemini and the
+# other provider credentials when started locally without manual export.
+load_dotenv(_PROJECT_ROOT / ".env", override=False)
 
 
 class TeamPolicy(BaseModel):
@@ -87,17 +94,25 @@ class ProviderSettings(BaseModel):
     openai_base_url: str = "https://api.openai.com"
     anthropic_api_key: str | None = None
     anthropic_base_url: str = "https://api.anthropic.com"
+    gemini_api_key: str | None = None
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     ollama_base_url: str = "http://localhost:11434"
     ollama_api_key: str | None = None
 
 
 @lru_cache(maxsize=1)
 def get_provider_settings() -> ProviderSettings:
+    # Re-load the workspace .env values each time the cached settings are
+    # requested so local development and tests can rely on the committed
+    # .env file even after environment variables were cleared or mutated.
+    load_dotenv(_PROJECT_ROOT / ".env", override=False)
     return ProviderSettings(
         openai_api_key=os.environ.get("OPENAI_API_KEY"),
         openai_base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com"),
         anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY"),
         anthropic_base_url=os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+        gemini_api_key=os.environ.get("GEMINI_API_KEY"),
+        gemini_base_url=os.environ.get("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"),
         ollama_base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
         ollama_api_key=os.environ.get("OLLAMA_API_KEY"),
     )

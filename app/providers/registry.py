@@ -20,6 +20,7 @@ from functools import lru_cache
 from app.core.config import ProviderSettings, get_provider_settings
 from app.providers.anthropic_adapter import AnthropicAdapter
 from app.providers.base import ProviderAdapter
+from app.providers.gemini_adapter import GeminiAdapter
 from app.providers.ollama_adapter import OllamaAdapter
 from app.providers.openai_adapter import OpenAIAdapter
 
@@ -44,6 +45,10 @@ def _adapters() -> dict[str, ProviderAdapter]:
     if settings.anthropic_api_key:
         adapters["anthropic"] = AnthropicAdapter(
             api_key=settings.anthropic_api_key, base_url=settings.anthropic_base_url
+        )
+    if settings.gemini_api_key:
+        adapters["gemini"] = GeminiAdapter(
+            api_key=settings.gemini_api_key, base_url=settings.gemini_base_url
         )
     # Ollama never requires a key for a local install, so it is always
     # registered (the base_url alone determines local vs. cloud).

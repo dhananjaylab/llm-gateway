@@ -26,6 +26,7 @@ teams:
   data-science:
     api_key_hash: "sha256:3495bea900033105c5e95c609a05b959649f8908419f8bd61183a26e12263533"
     allowed_models:
+      - "gemini:gemini-3.6-flash"
       - "openai:gpt-5.4"
       - "anthropic:claude-sonnet-5"
       - "ollama:llama3.2"

@@ -32,6 +32,7 @@ def _reset_singleton_caches(monkeypatch):
     """
     monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     monkeypatch.setenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
     config_module.reset_config_cache()

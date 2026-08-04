@@ -74,7 +74,8 @@ class AnthropicAdapter(ProviderAdapter):
         if request.system:
             payload["system"] = request.system
         if request.temperature is not None:
-            payload["temperature"] = request.temperature
+            # Anthropic supports temperature 0..1, so clamp values > 1
+            payload["temperature"] = min(request.temperature, 1.0)
         if request.top_p is not None:
             payload["top_p"] = request.top_p
         if request.stop is not None and request.stop:

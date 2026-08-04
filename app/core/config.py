@@ -43,9 +43,6 @@ class TeamConfig(BaseModel):
     team_id: str
     api_key_hash: str  # "sha256:<hex>" — see app/core/auth.py for the check
     allowed_models: list[str] = Field(default_factory=list)
-    # rpm_cap / tpm_cap / budget_cap_usd are read here so Phase 2's rate
-    # limiter has a real source of truth to wire up to — Phase 1's
-    # ratelimit stub does not consult them yet (see app/ratelimit/stub.py).
     rpm_cap: int = 60
     tpm_cap: int = 100_000
     budget_cap_usd: float = 50.0
@@ -77,11 +74,6 @@ def load_teams_config(path: str | Path | None = None) -> GatewayConfig:
 
 @lru_cache(maxsize=1)
 def get_gateway_config() -> GatewayConfig:
-    """
-    Process-wide config singleton. Cached deliberately (Phase 1 has no
-    hot-reload); call `reset_config_cache()` after mutating the underlying
-    file in a test.
-    """
     return load_teams_config()
 
 

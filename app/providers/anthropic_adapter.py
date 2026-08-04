@@ -77,7 +77,7 @@ class AnthropicAdapter(ProviderAdapter):
             payload["temperature"] = request.temperature
         if request.top_p is not None:
             payload["top_p"] = request.top_p
-        if request.stop:
+        if request.stop is not None and request.stop:
             payload["stop_sequences"] = request.stop
         return payload
 

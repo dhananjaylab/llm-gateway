@@ -68,7 +68,7 @@ class ProviderAdapter(ABC):
         """Provider-native JSON body -> unified schema."""
 
     @abstractmethod
-    async def stream(
+    def stream(
         self, payload: dict, *, request: UnifiedChatRequest, provider_model: str
     ) -> AsyncIterator[UnifiedStreamChunk]:
         """

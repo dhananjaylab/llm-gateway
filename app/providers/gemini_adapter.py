@@ -70,12 +70,20 @@ class GeminiAdapter(ProviderAdapter):
         return payload
 
     async def call(self, payload: dict) -> dict:
+        # `model` is smuggled into the payload dict only so this method can
+        # read it back out to build the URL — Gemini is the one adapter of
+        # the four that addresses the model via the request *path*
+        # (/models/{model}:generateContent) rather than a body field, unlike
+        # OpenAI/Anthropic/Ollama. Send everything else, but strip `model`
+        # itself before POSTing so the wire payload matches Gemini's actual
+        # documented request schema instead of carrying a stray extra key.
         model = payload.get("model", "")
+        body = {k: v for k, v in payload.items() if k != "model"}
         url = f"{self._base_url}/models/{model}:generateContent"
         headers = {"x-goog-api-key": self._api_key}
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.post(url, json=payload, headers=headers)
+                resp = await client.post(url, json=body, headers=headers)
         except httpx.TimeoutException as exc:
             raise ProviderError("gemini request timed out", retryable=True, error_type="timeout") from exc
         except httpx.TransportError as exc:
@@ -116,12 +124,28 @@ class GeminiAdapter(ProviderAdapter):
     async def stream(
         self, payload: dict, *, request: UnifiedChatRequest, provider_model: str
     ) -> AsyncIterator[UnifiedStreamChunk]:
+        # NOTE: this function must contain a `yield` even though it always
+        # raises. Whether a function is an async *generator* (supports
+        # `__anext__`/`async for`) is a static property of its body in
+        # Python, not of its return-type annotation or control flow. A
+        # bare `async def ...: raise ...` with no `yield` anywhere is just
+        # a coroutine function — calling it returns a coroutine object, not
+        # an async iterator, and `async for chunk in adapter.stream(...)`
+        # in app/api/v1_chat.py fails with a confusing `TypeError` (and a
+        # second `AttributeError` from the `agen.aclose()` cleanup) instead
+        # of the clean 501 ProviderError this is meant to produce. Worse,
+        # because StreamingResponse commits its headers before the body
+        # generator runs, that failure surfaces to the client as a silent
+        # `200 OK` with an empty body — not an error at all. The unreachable
+        # `yield` below is what makes this a real async generator so the
+        # ProviderError actually propagates and gets turned into a 502.
         raise ProviderError(
             "gemini streaming is not supported in this phase",
             status_code=501,
             retryable=False,
             error_type="unsupported_streaming",
         )
+        yield  # pragma: no cover — unreachable; see note above
 
 
 def _map_finish_reason(reason: str | None) -> str | None:

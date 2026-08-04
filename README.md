@@ -1,6 +1,6 @@
 # LLM Gateway — Phase 1: Unified Proxy Layer
 
-Status: **built, tested, passing (34/34)**. Timebox per the plan: Day 1-3.
+Status: **built, tested, passing (40/40)**. Timebox per the plan: Day 1-3.
 
 This is Phase 1 of 6 in the LLM Gateway project (see the project's own
 Document 06, Implementation Plan). Phase 1's goal, verbatim from that doc:
@@ -59,7 +59,8 @@ app/
 │  ├─ registry.py               # "openai:gpt-5.4" -> (adapter, "gpt-5.4")
 │  ├─ openai_adapter.py
 │  ├─ anthropic_adapter.py
-│  └─ ollama_adapter.py
+│  ├─ ollama_adapter.py
+│  └─ gemini_adapter.py        # non-streaming only — see note below
 ├─ ratelimit/stub.py           # permissive no-op — Phase 2 replaces this file
 └─ resilience/stub.py          # permissive no-op — Phase 3 replaces this file
 
@@ -106,6 +107,18 @@ tests/unit/                    # 34 tests, see mapping below
    **Open decision for developer sign-off:** migrate `app/providers/*` and
    the dev dependencies to `httpx2` once respx/pytest-httpx confirm
    support — it's a near drop-in given the matching async API.
+6. **A fourth provider, Gemini, was added on top of the documented Phase 1
+   scope** (the project's own PRD appendix recommends stopping at three
+   for v1 and revisiting after Phase 3's tier abstraction exists — see
+   Document 06 Appendix A). It's wired into the registry and `teams.yaml`
+   like the other three, but **`GeminiAdapter.stream()` deliberately
+   raises rather than streaming** — Gemini's streaming shape wasn't
+   implemented this phase. A client that requests
+   `"model": "gemini:...", "stream": true` gets a `200` (SSE headers
+   commit before the body generator can fail — true for any provider, not
+   Gemini-specific) containing a structured `event: error` frame with
+   `error_type: "unsupported_streaming"`, not a hang or a silent empty
+   response. Non-streaming Gemini calls work end-to-end.
 
 ## What's stubbed (by design) and where it gets replaced
 
@@ -127,10 +140,11 @@ tests/unit/                    # 34 tests, see mapping below
 | `test_auth.py` | Valid key → reaches the adapter; invalid key → 401; valid key + disallowed model → 403; unknown provider prefix → 400 |
 | `test_streaming_passthrough.py` | SSE chunks arrive in order/unmodified; TTFT is logged on the first chunk; a mid-stream client disconnect stops consuming from and closes the upstream generator (proven by chunk-count and an explicit `aclose()` check) |
 | `test_policy_injection.py` | PII redaction and system-prompt injection apply only when a team's policy enables them, and never mutate the caller's original request object |
+| `test_gemini_provider.py` | Gemini request/response translation; the registry registers Gemini when its key is set; `.env` credential loading works (via a throwaway temp `.env`, not a real one — see patch note below); Gemini's `stream()` raises a real `ProviderError` (not a `TypeError`) and the endpoint surfaces it as a structured SSE error frame, not silence; `call()` no longer leaks a stray `model` field into the outgoing JSON body |
 
 ```
 $ pytest -v
-======================== 34 passed in 0.4s ========================
+======================== 40 passed in 0.4s ========================
 ```
 
 ## Done criteria (from the project plan) — status
@@ -145,6 +159,16 @@ $ pytest -v
 - [x] No provider SDK type appears outside `app/providers/` — nothing
       beyond `httpx` (a generic HTTP client, not a provider SDK) is
       imported outside that package; confirmed by grep.
+
+## Patch note: Gemini adapter validation pass
+
+A Gemini adapter was added on top of the original Phase 1 delivery. Validating it against a clean checkout (no local `.env`, exactly what a fresh clone has) surfaced three real bugs, all fixed here:
+
+1. **Streaming crashed instead of failing cleanly.** `GeminiAdapter.stream()` had no `yield` in its body, so Python treated it as a plain coroutine, not an async generator. `async for chunk in adapter.stream(...)` raised `TypeError: 'async for' requires an object with __aiter__ method, got coroutine`, and because `StreamingResponse` had already committed a `200` status before the body generator ran, a client requesting `"model": "gemini:...", "stream": true` got back a **silent, empty `200 OK`** — not an error, not a timeout, nothing. Fixed by adding an unreachable `yield` after the `raise`, which is what makes a function a real async generator in Python regardless of whether the `yield` ever executes. Confirmed via `test_gemini_stream_raises_a_clean_provider_error_not_a_type_error` and `test_gemini_streaming_request_surfaces_a_structured_error_not_silence`.
+2. **A flaky test.** The original `test_provider_settings_load_from_dotenv` deleted `GEMINI_API_KEY` from the environment and asserted the loaded value "is not None" — which only passed if a real, untracked `.env` with a live key happened to exist on the machine running the test. On a clean clone it fails (confirmed: 36/37 passing before this patch). Fixed by pointing `config_module._PROJECT_ROOT` at a `tmp_path` containing a throwaway `.env`, and asserting the *exact* value it declares.
+3. **`call()` leaked a stray `model` field into the Gemini request body.** `model` is embedded in the payload dict so `call()` can read it back out to build the URL (Gemini addresses the model via the path, unlike the other three adapters) — but the original code then POSTed that same dict verbatim, including `model`, which has no place in Gemini's documented request schema. Fixed by stripping it from a copy of the payload before the POST. Confirmed via `test_gemini_call_does_not_leak_model_field_into_request_body` (respx-mocked).
+
+Also fixed in this pass: `requirements-dev.txt` had been folded into `requirements.txt` without updating the README, so the README's own first install command (`pip install -r requirements-dev.txt`) failed on a clean clone — restored as a separate file. `.gitignore` was missing from the delivery, which matters more now that `app/core/config.py` auto-loads a local `.env` — restored.
 
 ## Developer sign-off requested before Phase 2
 

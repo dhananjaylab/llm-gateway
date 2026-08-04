@@ -71,7 +71,7 @@ class OllamaAdapter(ProviderAdapter):
             options["temperature"] = request.temperature
         if request.top_p is not None:
             options["top_p"] = request.top_p
-        if request.stop:
+        if request.stop is not None and request.stop:
             options["stop"] = request.stop
 
         return {

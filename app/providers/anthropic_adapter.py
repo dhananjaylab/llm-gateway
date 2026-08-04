@@ -73,11 +73,15 @@ class AnthropicAdapter(ProviderAdapter):
         }
         if request.system:
             payload["system"] = request.system
-        if request.temperature is not None:
-            payload["temperature"] = request.temperature
-        if request.top_p is not None:
-            payload["top_p"] = request.top_p
-        if request.stop:
+        # NOTE: Claude Sonnet 5, Opus 4.7+ have completely removed support for
+        # temperature, top_p, and top_k sampling parameters. Setting them to any
+        # value (including non-default) returns a 400 error. The docs explicitly
+        # state: "Remove these parameters when migrating; the default value (or
+        # omitting the parameter) is accepted."
+        # We omit these parameters entirely to maintain compatibility with newer
+        # models. For older models that still support them, clients should use
+        # system prompt instructions instead.
+        if request.stop is not None and request.stop:
             payload["stop_sequences"] = request.stop
         return payload
 

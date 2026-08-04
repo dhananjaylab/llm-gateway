@@ -70,8 +70,8 @@ class OpenAIAdapter(ProviderAdapter):
             payload["temperature"] = request.temperature
         if request.top_p is not None:
             payload["top_p"] = request.top_p
-        if request.stop is not None and request.stop:
-            payload["stop"] = request.stop
+        # if request.stop is not None and request.stop:
+        #     payload["stop"] = request.stop
         if request.response_format is not None:
             payload["response_format"] = {"type": request.response_format.type}
         if request.stream:

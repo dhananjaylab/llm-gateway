@@ -46,9 +46,16 @@ class TestOpenAITranslation:
         assert payload["max_completion_tokens"] == 256
         assert "max_tokens" not in payload
 
-    def test_stop_sequences_pass_through_as_stop(self):
+    def test_stop_sequences_are_not_forwarded_gpt5_rejects_the_param(self):
+        """
+        GPT-5.x rejects `stop` outright (400 "Unsupported parameter: 'stop'
+        is not supported with this model") — confirmed for gpt-5.4, the
+        model this gateway currently serves. Unlike Anthropic and Ollama,
+        which both accept a client-supplied `stop` and forward it, the
+        OpenAI adapter must never include this key in the outgoing payload.
+        """
         payload = self.adapter.translate_request(_unified_request(), provider_model="gpt-5.4")
-        assert payload["stop"] == ["\n\nEND"]
+        assert "stop" not in payload
 
     def test_model_field_is_the_provider_model_not_the_unified_id(self):
         payload = self.adapter.translate_request(_unified_request(), provider_model="gpt-5.4")

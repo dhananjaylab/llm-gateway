@@ -6,9 +6,13 @@ current-generation chat models (the GPT-5.x family) require
 `max_completion_tokens` rather than the legacy `max_tokens` field, and
 support `stream_options: {"include_usage": true}` to get a final usage
 frame on a streamed response instead of having to locally re-tokenize.
-Both are applied below. Re-verify field names against
-https://platform.openai.com/docs/api-reference/chat before pinning a model
-family in production, since this is the adapter most likely to drift.
+Both are applied below. GPT-5.x also rejects the `stop` parameter outright
+(400 "Unsupported parameter: 'stop' is not supported with this model") —
+confirmed for gpt-5.4, the model this gateway currently serves — so it is
+never forwarded (see the comment in translate_request). Re-verify field
+names against https://platform.openai.com/docs/api-reference/chat before
+pinning a model family in production, since this is the adapter most
+likely to drift.
 
 Endpoint: POST {base_url}/v1/chat/completions
 Auth: Authorization: Bearer <OPENAI_API_KEY>
@@ -70,8 +74,19 @@ class OpenAIAdapter(ProviderAdapter):
             payload["temperature"] = request.temperature
         if request.top_p is not None:
             payload["top_p"] = request.top_p
-        # if request.stop is not None and request.stop:
-        #     payload["stop"] = request.stop
+        # NOTE: GPT-5.x models (gpt-5.4, the model this gateway currently
+        # serves per config/teams.yaml, included) reject the `stop`
+        # parameter outright with "400 Unsupported parameter: 'stop' is not
+        # supported with this model" — confirmed against multiple current
+        # reports for this exact model family, not a hypothetical. Unlike
+        # Anthropic's temperature/top_p removal (see anthropic_adapter.py),
+        # this constraint is model-specific rather than provider-wide: an
+        # older model (e.g. gpt-4o) still accepts `stop`. Phase 1's adapter
+        # has no per-served-model conditional logic, and every OpenAI model
+        # currently configured in teams.yaml is GPT-5.x, so `stop` is
+        # deliberately never forwarded here. If an older model is added to
+        # this adapter's scope later, this needs to become conditional on
+        # provider_model rather than blanket-omitted.
         if request.response_format is not None:
             payload["response_format"] = {"type": request.response_format.type}
         if request.stream:

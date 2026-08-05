@@ -19,7 +19,7 @@ replacements, not refactors.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate      # or .venv\Scripts\activate on Windows
-pip install -r requirements-dev.txt
+pip install -r requirements.txt                          # includes pytest/respx — repo doesn't split runtime/dev deps
 cp .env.example .env                                     # fill in whichever provider keys you have
 uvicorn app.main:app --reload --port 8000
 ```
@@ -169,6 +169,17 @@ A Gemini adapter was added on top of the original Phase 1 delivery. Validating i
 3. **`call()` leaked a stray `model` field into the Gemini request body.** `model` is embedded in the payload dict so `call()` can read it back out to build the URL (Gemini addresses the model via the path, unlike the other three adapters) — but the original code then POSTed that same dict verbatim, including `model`, which has no place in Gemini's documented request schema. Fixed by stripping it from a copy of the payload before the POST. Confirmed via `test_gemini_call_does_not_leak_model_field_into_request_body` (respx-mocked).
 
 Also fixed in this pass: `requirements-dev.txt` had been folded into `requirements.txt` without updating the README, so the README's own first install command (`pip install -r requirements-dev.txt`) failed on a clean clone — restored as a separate file. `.gitignore` was missing from the delivery, which matters more now that `app/core/config.py` auto-loads a local `.env` — restored.
+
+## Patch note: openai/anthropic live-call fixes validation pass
+
+Manual testing against real OpenAI, Gemini, and Anthropic accounts (Ollama untested — see below) surfaced two adapter-level fixes, both backed by verified, current provider constraints:
+
+- **Anthropic**: `temperature`/`top_p` are no longer sent at all. Claude Sonnet 5 and Opus 4.7+ return a 400 on any non-default sampling parameter (`"temperature is deprecated for this model"`) — confirmed against Anthropic's own migration guide. Correct fix, well-documented in the adapter itself.
+- **OpenAI**: `stop` is no longer sent. GPT-5.4 (the model this gateway serves) rejects it with `400 Unsupported parameter: 'stop' is not supported with this model` — confirmed against multiple current reports for this exact model. The underlying fix was correct, but it shipped as commented-out dead code with no rationale, which silently broke `test_stop_sequences_pass_through_as_stop` (confirmed failing: 39/40 on this commit) and would have blocked signoff on its own. Fixed by removing the dead code, documenting the constraint the same way the Anthropic adapter does, and rewriting the test to assert the new, intentional behavior (`test_stop_sequences_are_not_forwarded_gpt5_rejects_the_param`) instead of leaving a known failure in the suite.
+
+Also fixed: the `requirements-dev.txt` install instruction had regressed a second time (the repo consolidated back to a single `requirements.txt` without updating the README) — this time the README was changed to match the file that actually exists, rather than re-splitting the file again, since that's the second time these have drifted apart.
+
+**Ollama**: code is unchanged from the already-validated Phase 1 baseline (no diff in `ollama_adapter.py` beyond a no-op condition rewrite), so this is very unlikely to be a new regression from this round of changes. Most likely causes, in order: (1) local Ollama isn't running, or `OLLAMA_BASE_URL` doesn't reach it — very common from inside Docker/WSL, where `localhost` resolves to the container, not the host; (2) the exact tag `llama3.2` isn't pulled (`ollama pull llama3.2`); (3) a firewall or reverse proxy in between. Both of the adapter's failure paths (connection failure and a non-2xx response from Ollama) already surface a descriptive `502` with the underlying error message in the body — worth checking that response body directly, since it should already point at the cause.
 
 ## Developer sign-off requested before Phase 2
 

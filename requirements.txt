@@ -1,20 +1,21 @@
-# Phase 1 runtime dependencies.
+# Phase 2 runtime + test dependencies (repo doesn't split runtime/dev deps
+# — see Phase 1 README patch notes on why that split kept regressing).
 #
-# VERSION NOTE (verify before every fresh install — this stack moves
-# monthly per the TRD working agreement): versions below were confirmed
-# current as of Aug 2, 2026 via `pip index versions <pkg>` / PyPI. Re-check
-# before pinning tighter for a real deploy.
+# VERSION NOTE (per the "search first" working agreement): versions below
+# were confirmed current as of Aug 6, 2026 via `pip index versions <pkg>`
+# / PyPI. Re-check before pinning tighter for a real deploy — this stack
+# moves monthly.
 #
-# OPEN DECISION flagged for developer sign-off: a Pydantic-stewarded
-# successor package, `httpx2`, now exists (PyPI, "next-generation HTTP
-# client", api-compatible with httpx's AsyncClient/.stream()/aiter_lines()).
-# httpx (classic) is still current, stable, and is what FastAPI's own
-# TestClient and the respx/pytest-httpx mocking libraries are built
-# against today. This build stays on classic httpx for Phase 1 so the test
-# suite has full, proven mock-transport support; migrate to httpx2 once
-# respx/pytest-httpx confirm compatibility, since the async API surface
-# used in app/providers/*_adapter.py (AsyncClient, .stream(), aiter_lines())
-# is already a drop-in match.
+# NEW IN PHASE 2:
+#   redis        - async client (redis.asyncio), EVALSHA/Lua scripting,
+#                  pipelines, pub/sub. redis-py has shipped the merged
+#                  aioredis API since 4.2; nothing extra needed.
+#   fakeredis[lua] - in-memory Redis double for tests. The [lua] extra
+#                  pulls in `lupa` (a Lua-in-Python binding) so EVAL/
+#                  EVALSHA against the real .lua scripts in
+#                  app/ratelimit/*.lua work in tests without a real Redis
+#                  server. This is what makes `pytest` runnable with zero
+#                  external services, same as Phase 1.
 
 fastapi[standard]>=0.136,<0.138
 uvicorn[standard]>=0.34,<0.35
@@ -22,6 +23,8 @@ pydantic>=2.13,<3
 httpx>=0.28,<0.29
 pyyaml>=6.0,<7
 python-dotenv>=1.0,<2
+redis>=8.1,<9
 pytest>=8.3,<9
 pytest-asyncio>=0.24,<0.25
 respx>=0.21,<0.22
+fakeredis[lua]>=2.36,<3

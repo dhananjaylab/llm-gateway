@@ -15,16 +15,16 @@ from app.providers.openai_adapter import OpenAIAdapter
 
 
 def _unified_request(**overrides) -> UnifiedChatRequest:
-    defaults = dict(
-        model="placeholder:placeholder",
-        system="You are a helpful enterprise assistant.",
-        messages=[
+    defaults = {
+        "model": "placeholder:placeholder",
+        "system": "You are a helpful enterprise assistant.",
+        "messages": [
             ChatMessage(role="user", content="What is a token bucket?"),
         ],
-        max_tokens=256,
-        temperature=0.4,
-        stop=["\n\nEND"],
-    )
+        "max_tokens": 256,
+        "temperature": 0.4,
+        "stop": ["\n\nEND"],
+    }
     defaults.update(overrides)
     return UnifiedChatRequest(**defaults)
 
@@ -47,13 +47,6 @@ class TestOpenAITranslation:
         assert "max_tokens" not in payload
 
     def test_stop_sequences_are_not_forwarded_gpt5_rejects_the_param(self):
-        """
-        GPT-5.x rejects `stop` outright (400 "Unsupported parameter: 'stop'
-        is not supported with this model") — confirmed for gpt-5.4, the
-        model this gateway currently serves. Unlike Anthropic and Ollama,
-        which both accept a client-supplied `stop` and forward it, the
-        OpenAI adapter must never include this key in the outgoing payload.
-        """
         payload = self.adapter.translate_request(_unified_request(), provider_model="gpt-5.4")
         assert "stop" not in payload
 

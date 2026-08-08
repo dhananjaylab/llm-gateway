@@ -1,0 +1,17 @@
+# Phase 2 scope: just Redis, so `docker-compose up -d` gets a developer to
+# a working REDIS_URL without installing Redis locally. The full stack
+# (gateway container, Prometheus, Grafana, mock/chaos provider endpoints,
+# demo-team seeding as an init container) is Document 06 Phase 5's
+# deliverable — deliberately not built here to avoid scope creep into a
+# later phase's done criteria.
+
+services:
+  redis:
+    image: redis:8-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5

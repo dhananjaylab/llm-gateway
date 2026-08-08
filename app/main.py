@@ -1,34 +1,128 @@
 """
 FastAPI app factory.
 
-GET /healthz and /readyz are liveness/readiness for the gateway *process*
-itself (container orchestration probes) — not provider health, which is a
-Phase 3 concept (app/resilience/health.py) exposed on the Operations
-Grafana dashboard, not here.
+Phase 2 adds a real `lifespan`: on startup it builds the async Redis
+client, seeds `team_config:*` from teams.yaml if Redis is empty, and
+constructs the Phase 2 services (RateLimiter, BudgetEnforcer,
+BatchPriorityQueue, AuditLog, pricing table) once, attaching all of them
+to `app.state` so route handlers never construct their own — this is
+also the seam tests use to inject a fake Redis client (`create_app(
+redis_client=...)`) instead of connecting to a real one.
+
+GET /readyz now actually means something: Phase 1's version returned
+"ready" unconditionally ("there is no Redis/provider dependency to check
+readiness against yet"); Phase 2 pings Redis, since a gateway that can't
+reach its rate-limit/budget store is not meaningfully ready to serve
+traffic under the "fail loudly" posture the TRD asks for.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from redis.asyncio import Redis
 
+from app.api.admin import router as admin_router
 from app.api.v1_chat import router as v1_chat_router
+from app.core.audit import AuditLog
+from app.core.config import get_gateway_settings, load_teams_config
+from app.core.pricing import load_pricing
+from app.core.redis_client import build_redis_client
+from app.core.team_store import TeamConfigStore
+from app.ratelimit.budget import BudgetEnforcer
+from app.ratelimit.limiter import RateLimiter
+from app.ratelimit.priority_queue import BatchPriorityQueue
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("gateway.main")
 
 
-def create_app() -> FastAPI:
+async def _listen_for_config_changes(app: FastAPI) -> None:
+    """
+    Background task: invalidate this instance's local TeamConfigStore
+    cache the moment ANY instance (including this one, redundantly but
+    harmlessly) PATCHes a team via the Admin API. See team_store.py's
+    module docstring for why this exists alongside the short cache TTL
+    rather than instead of it.
+    """
+    redis: Redis = app.state.redis
+    pubsub = redis.pubsub()
+    await pubsub.subscribe(TeamConfigStore.CONFIG_CHANGE_CHANNEL)
+    try:
+        async for message in pubsub.listen():
+            if message.get("type") != "message":
+                continue
+            team_id = message["data"]
+            app.state.team_store.invalidate(team_id)
+            logger.debug("config-change event: invalidated cache for team=%s", team_id)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await pubsub.unsubscribe(TeamConfigStore.CONFIG_CHANGE_CHANNEL)
+        await pubsub.aclose()
+
+
+def _build_lifespan(redis_client_override: Redis | None):
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        settings = get_gateway_settings()
+        owns_redis = redis_client_override is None
+        redis_client = redis_client_override or build_redis_client(settings.redis_url)
+
+        app.state.redis = redis_client
+        app.state.team_store = TeamConfigStore(redis_client)
+        app.state.rate_limiter = RateLimiter(
+            redis_client,
+            key_ttl_seconds=settings.rate_limit_key_ttl_seconds,
+            fail_open=settings.rate_limit_fail_open,
+        )
+        app.state.budget_enforcer = BudgetEnforcer(redis_client, warn_fraction=settings.budget_warn_fraction)
+        app.state.batch_queue = BatchPriorityQueue(
+            redis_client,
+            max_wait_seconds=settings.batch_queue_max_wait_seconds,
+            poll_interval_seconds=settings.batch_queue_poll_interval_seconds,
+            max_queue_length=settings.batch_queue_max_length,
+        )
+        app.state.audit_log = AuditLog(redis_client)
+        app.state.pricing = load_pricing(settings.pricing_path)
+
+        seeded = await app.state.team_store.seed_from_yaml_if_empty(load_teams_config())
+        if seeded:
+            logger.info("bootstrap-seeded %d teams into Redis from config/teams.yaml", seeded)
+
+        listener_task = asyncio.create_task(_listen_for_config_changes(app))
+
+        try:
+            yield
+        finally:
+            listener_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await listener_task
+            if owns_redis:
+                await redis_client.aclose()
+
+    return lifespan
+
+
+def create_app(*, redis_client: Redis | None = None) -> FastAPI:
     app = FastAPI(
         title="LLM Gateway",
-        version="0.1.0",
+        version="0.2.0",
         description=(
             "Multi-provider LLM API gateway: unified schema, rate limiting, "
-            "fallback routing, and observability. Phase 1: unified proxy layer."
+            "fallback routing, and observability. Phase 2: distributed rate "
+            "limiting, budget enforcement, priority queueing, Admin API."
         ),
+        lifespan=_build_lifespan(redis_client),
     )
 
     app.include_router(v1_chat_router)
+    app.include_router(admin_router)
 
     @app.get("/healthz")
     async def healthz():
@@ -36,9 +130,13 @@ def create_app() -> FastAPI:
 
     @app.get("/readyz")
     async def readyz():
-        # Phase 1: the process is ready as soon as it can serve traffic —
-        # there is no Redis/provider dependency to check readiness against
-        # yet. Phase 2 adds a Redis ping here.
+        try:
+            await app.state.redis.ping()
+        except Exception as exc:
+            logger.warning("readyz: redis ping failed", exc_info=exc)
+            return JSONResponse(
+                status_code=503, content={"status": "not_ready", "reason": "redis_unreachable"}
+            )
         return {"status": "ready"}
 
     return app

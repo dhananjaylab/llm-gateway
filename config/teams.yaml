@@ -1,26 +1,24 @@
-# Per-team gateway configuration.
+# Per-team gateway configuration — Phase 2 SEED data.
+#
+# IMPORTANT (Phase 2 change): this file is now only the *bootstrap seed*.
+# On first boot, if Redis has no team_config:* keys yet, the gateway loads
+# this file once and writes it into Redis (see app/core/team_store.py,
+# TeamConfigStore.seed_from_yaml_if_empty). After that, Redis is the
+# runtime source of truth and the Admin API (PATCH /admin/limits/{team},
+# PATCH /admin/budgets/{team}) is what mutates live config — editing this
+# file after first boot has no effect until Redis is flushed. See the
+# Phase 2 README "Design decisions" section for the full rationale.
 #
 # api_key_hash is sha256("<raw key>"), never the raw key — see
-# scripts/hash_api_key.py to generate one for a new team. The raw demo
-# keys below exist only so this file is runnable out of the box; rotate
-# them before this ever points at a real provider account.
+# scripts/hash_api_key.py to generate one for a new team.
 #
 #   data-science   -> sk-gw-datascience-demo-001
 #   product-eng    -> sk-gw-producteng-demo-002
 #   batch-devs     -> sk-gw-batchdevs-demo-003
 #
-# rpm_cap / tpm_cap / budget_cap_usd are read into TeamConfig now so
-# Phase 2's rate limiter and budget enforcement have a real source of
-# truth to wire up to; the Phase 1 stub (app/ratelimit/stub.py) does not
-# enforce them yet.
-#
-# `model` on a request must be a provider-qualified id — "<provider>:<model>"
-# — matching one of a team's allowed_models. VERSION NOTE: the example
-# model ids below (gpt-5.4, claude-sonnet-5, claude-haiku-4-5-20251001,
-# llama3.2) were current at time of writing; provider model catalogs shift
-# monthly; re-verify before pointing this at production traffic. The
-# abstract "tier-1-reasoning"-style tier names from the TRD arrive in
-# Phase 3 — Phase 1 requests must name a concrete provider:model pair.
+# rpm_cap / tpm_cap / budget_cap_usd are now REAL, atomically enforced
+# limits as of Phase 2 (app/ratelimit/limiter.py, app/ratelimit/budget.py)
+# — Phase 1's stub ignored them.
 
 teams:
   data-science:

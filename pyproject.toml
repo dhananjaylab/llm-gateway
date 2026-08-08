@@ -1,0 +1,16 @@
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "C4", "SIM", "RUF"]
+ignore = [
+    "B008",  # FastAPI's Depends()/Header()/Query() in argument defaults is the
+             # idiomatic, documented pattern (FastAPI's own docs use it
+             # throughout) — not the "mutable default argument" footgun this
+             # rule exists to catch. Excluded project-wide rather than
+             # per-line-noqa'd, since it recurs on every route.
+]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Header", "fastapi.Query"]

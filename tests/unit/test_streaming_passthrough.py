@@ -62,14 +62,13 @@ def test_ttft_is_logged_on_first_chunk(client, monkeypatch, caplog):
         "messages": [{"role": "user", "content": "hi"}],
         "stream": True,
     }
-    with caplog.at_level(logging.INFO, logger="gateway.v1_chat"):
-        with client.stream(
-            "POST",
-            "/v1/chat/completions",
-            json=body,
-            headers={"X-Gateway-API-Key": DATA_SCIENCE_KEY},
-        ) as resp:
-            resp.read()
+    with caplog.at_level(logging.INFO, logger="gateway.v1_chat"), client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json=body,
+        headers={"X-Gateway-API-Key": DATA_SCIENCE_KEY},
+    ) as resp:
+        resp.read()
 
     ttft_records = [r for r in caplog.records if r.getMessage() == "time_to_first_token"]
     assert len(ttft_records) == 1
@@ -99,6 +98,22 @@ class _TrackingAdapter(FakeAdapter):
         super().__init__(stream_chunks=["c0", "c1", "c2", "c3", "c4"])
 
 
+class _NoopRateLimiter:
+    """Records reconcile() calls without touching Redis — this test is
+    about disconnect handling, not rate-limit bookkeeping."""
+
+    def __init__(self) -> None:
+        self.reconcile_calls: list[tuple[int, int]] = []
+
+    async def reconcile(self, *, team, reserved_tokens, actual_tokens) -> None:
+        self.reconcile_calls.append((reserved_tokens, actual_tokens))
+
+
+class _NoopBudgetEnforcer:
+    async def record_spend(self, team, cost_usd) -> None:
+        return None
+
+
 async def test_client_disconnect_cancels_the_upstream_call():
     from app.core.config import TeamConfig, TeamPolicy
 
@@ -113,6 +128,7 @@ async def test_client_disconnect_cancels_the_upstream_call():
         allowed_models=["openai:gpt-5.4"],
         policy=TeamPolicy(),
     )
+    rate_limiter = _NoopRateLimiter()
 
     received: list = []  # list[ServerSentEvent], the shape _stream_response yields
     async for event in _stream_response(
@@ -122,6 +138,10 @@ async def test_client_disconnect_cancels_the_upstream_call():
         provider_model="gpt-5.4-served",
         http_request=fake_request,
         team=team,
+        reserved_tokens=42,
+        rate_limiter=rate_limiter,
+        budget_enforcer=_NoopBudgetEnforcer(),
+        pricing_table={},
     ):
         received.append(event)
 
@@ -134,3 +154,7 @@ async def test_client_disconnect_cancels_the_upstream_call():
     # And its cleanup path (aclose()) ran, proving the upstream call was
     # actually cancelled rather than left dangling.
     assert adapter.stream_closed is True
+    # Phase 2: the reservation is still reconciled (refunded) even though
+    # the stream was cut short — actual_tokens=0 since no usage chunk
+    # ever arrived (the terminal usage chunk was never reached).
+    assert rate_limiter.reconcile_calls == [(42, 0)]

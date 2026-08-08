@@ -75,7 +75,6 @@ def test_anthropic_response_normalizes_content_block_text():
     assert unified.provider == "anthropic"
     assert unified.model_served == "claude-sonnet-5"
     assert unified.choices[0].message.content == "Token buckets refill over time."
-    # Anthropic's "end_turn" maps to the unified schema's "stop".
     assert unified.choices[0].finish_reason == "stop"
     assert unified.usage.input_tokens == 12
     assert unified.usage.output_tokens == 8
@@ -138,8 +137,6 @@ def test_ollama_response_mints_an_id_since_ollama_has_none():
 
 
 def test_all_three_providers_produce_the_same_response_shape():
-    """The whole point: a caller can't tell which provider served the request
-    from the shape of the response alone."""
     openai_unified = OpenAIAdapter(api_key="k").translate_response(
         {
             "id": "1",

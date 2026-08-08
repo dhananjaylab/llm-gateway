@@ -3,7 +3,8 @@ test_policy_injection.py
 
 Verifies: "System prompt prefix and PII redaction apply only for teams
 with the policy enabled, and never mutate the original client payload in
-logs" — per the Phase 1 test plan.
+logs" — per the Phase 1 test plan. Unchanged in Phase 2 (policy.py wasn't
+touched this phase).
 """
 
 from __future__ import annotations
@@ -88,7 +89,5 @@ def test_apply_policy_never_mutates_the_original_request():
     assert enriched is not original
     assert original.messages[0].content == original_content_before
     assert original.system == original_system_before
-    # And the enriched copy actually did change, proving this isn't a
-    # trivial pass — the original and the enriched copy now differ.
     assert enriched.messages[0].content != original.messages[0].content
     assert enriched.system != original.system

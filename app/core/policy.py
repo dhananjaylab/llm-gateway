@@ -1,20 +1,9 @@
 """
 Request enrichment: system-prompt injection and PII redaction.
 
-Both are configurable per team via teams.yaml (`policy.system_prompt_prefix`,
-`policy.pii_redaction`), never hardcoded — this is what "centralizes policy
-enforcement without requiring every team to implement it themselves" means
-in the original project brief.
-
-`apply_policy` returns a *new* UnifiedChatRequest and never mutates the one
-it was given: the TRD's Phase 1 test plan explicitly checks that policy
-application "never mutate[s] the original client payload in logs," which
-only holds if callers keep a reference to the pre-policy request for
-logging/audit before this function ever touches it.
-
-v1 PII patterns are intentionally simple (regex, not an NLP model) per the
-PRD's "Out of scope" section — matches the reference implementation in
-enterprise_llm_gateway_architect.html.
+Unchanged from Phase 1 — Phase 2 does not touch policy application, only
+what happens before/after it in the pipeline (rate limit + budget now
+wrap it with real enforcement instead of stubs).
 """
 
 from __future__ import annotations

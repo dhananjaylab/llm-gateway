@@ -1,17 +1,15 @@
 """
-Phase 1 rate-limit stub.
+Phase 1 rate-limit stub — SUPERSEDED by app/ratelimit/limiter.py as of
+Phase 2. `app/api/v1_chat.py` no longer imports this file.
 
-Per the TRD's Concise Implementation Guide: "Stub rate limiting and circuit
-breakers as permissive no-ops in this phase (always allow, always Closed) —
-real logic arrives in Phases 2-3. Do not skip building their call sites;
-wire the interface now so Phase 2 is a drop-in replacement, not a refactor."
-
-Phase 2 replaces `RateLimiter` with a Redis-backed implementation (see
-Document 05's `rl:{team_id}:rpm` / `rl:{team_id}:tpm` key schema and the
-token_bucket.lua script) that implements this exact same `check()` method
-signature, consulting the `rpm_cap` / `tpm_cap` fields already present on
-TeamConfig (see app/core/config.py) — the route handler in
-app/api/v1_chat.py never has to change, only the object it calls.
+Retained (not deleted) for two reasons: it's the cleanest possible
+reference for the interface `RateLimiter` had to preserve (`check()` /
+`reconcile()` — Phase 2's real implementation keeps the same method
+signatures, per the Phase 1 TRD note: "the route handler never has to
+change, only the object it calls"), and it remains a handy always-allow
+test double for tests that want to exercise something else (e.g.
+streaming disconnect handling in test_streaming_passthrough.py) without
+also standing up Redis/fakeredis.
 """
 
 from __future__ import annotations
@@ -28,7 +26,7 @@ class RateLimitDecision:
 
 
 class RateLimiter:
-    """Always allows. No Redis, no state, no per-team accounting yet."""
+    """Always allows. No Redis, no state, no per-team accounting — Phase 1 behavior."""
 
     async def check(
         self, *, team_id: str, estimated_tokens: int, priority: str
@@ -36,5 +34,4 @@ class RateLimiter:
         return RateLimitDecision(allowed=True)
 
     async def reconcile(self, *, team_id: str, reserved_tokens: int, actual_tokens: int) -> None:
-        """No-op in Phase 1; Phase 2 refunds the reservation delta (see TRD § Phase 2)."""
         return None

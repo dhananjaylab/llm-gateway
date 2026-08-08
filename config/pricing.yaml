@@ -1,0 +1,55 @@
+# Per-model $ pricing for Phase 2 budget cost calculation.
+#
+# VERSION NOTE (per the project's "search first" working agreement):
+# figures below were checked against public provider pricing pages and
+# pricing aggregators on Aug 6, 2026. Every one of these numbers moves on
+# its own schedule (OpenAI has repriced the GPT-5.x line twice this year;
+# Anthropic's Sonnet 5 rate below is an *introductory* rate that expires
+# 2026-08-31). This table is deliberately data, not code, so a pricing
+# change is a one-line YAML edit, not a redeploy. Re-verify every row
+# before pointing this gateway at anything that bills a real person.
+#
+# Lookup is by longest-matching model-name prefix within a provider (see
+# app/core/pricing.py::_lookup), so a served model string with a dated
+# snapshot suffix (e.g. OpenAI's "gpt-5.4-2026-03-05") still resolves to
+# the "gpt-5.4" rate below without every dated snapshot needing its own row.
+#
+# cache_read_per_million: the discounted rate for a cache-hit read (both
+# OpenAI and Anthropic bill this well below standard input price).
+# cache_write_per_million is intentionally omitted for all current rows —
+# neither provider's *documented, generally-available* cache-write rate
+# was pinned down with confidence during this pass; omit it (not zero-cost
+# it) so calculate_cost_usd() simply skips that term rather than silently
+# under-billing a real cache-write-heavy workload. Add it once verified.
+
+models:
+  "openai:gpt-5.4":
+    input_per_million: 2.50
+    output_per_million: 15.00
+    cache_read_per_million: 0.25 # ~10% of input, matches OpenAI's published discount ratio
+
+  "anthropic:claude-sonnet-5":
+    # Introductory rate through 2026-08-31 per Anthropic's Sonnet 5 launch
+    # post; standard rate ($3.00 / $15.00) takes effect 2026-09-01 — bump
+    # this row then, or wire a scheduled rotation if this outlives that date.
+    input_per_million: 2.00
+    output_per_million: 10.00
+    cache_read_per_million: 0.20
+
+  "anthropic:claude-haiku-4-5":
+    input_per_million: 1.00
+    output_per_million: 5.00
+    cache_read_per_million: 0.10
+
+  "gemini:gemini-3.6-flash":
+    # Flash-tier estimate carried forward from the project's own reference
+    # prototype (enterprise_llm_gateway_architect.html used $0.15 / $0.60
+    # for gemini-3-flash-preview) — re-verify against the current Gemini
+    # API pricing page before relying on this row; it was not independently
+    # re-confirmed for the 3.6 snapshot during this pass.
+    input_per_million: 0.15
+    output_per_million: 0.60
+
+  "ollama:": # empty model-name prefix = fallback for ANY local Ollama model
+    input_per_million: 0.0
+    output_per_million: 0.0 # self-hosted — no per-token API cost to the gateway operator

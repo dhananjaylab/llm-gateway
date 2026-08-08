@@ -3,27 +3,23 @@ Authentication.
 
 Per Document 05 (Backend Schema) SECURITY NOTE: team API keys are hashed
 at rest and compared by hash, exactly like password storage — the raw key
-is never stored, logged, or returned by any endpoint. Phase 1 hashes with
-sha256 and compares against teams.yaml's `api_key_hash` field; this is the
-same comparison Phase 2's Redis-backed lookup performs, just against a
-YAML-sourced dict instead of `team_config:{team_id}` — the hashing contract
-does not change between phases.
+is never stored, logged, or returned by any endpoint. Phase 1 hashed with
+sha256 and compared against teams.yaml's `api_key_hash` field.
 
-There is one linear auth path (per Document 03, App/Request Flow): client
-presents X-Gateway-API-Key -> gateway resolves it to a TeamConfig -> the
-request proceeds, or is rejected with 401 if the key is invalid/unknown.
-The second check — is the requested model in this team's allow-list — is
-deliberately *not* done here, since the model only becomes known once the
-request body is parsed; see `enforce_model_allowed` in app/api/v1_chat.py.
+Phase 2 change: `resolve_team` now resolves against the Redis-backed
+`TeamConfigStore` (app/core/team_store.py) instead of the static
+in-memory `GatewayConfig` — this is what makes Admin API changes (Phase 2)
+visible to the *next* request with no restart. The hashing contract itself
+is unchanged from Phase 1.
 """
 
 from __future__ import annotations
 
 import hashlib
 
-from fastapi import Header, HTTPException, status
+from fastapi import Header, HTTPException, Request, status
 
-from app.core.config import GatewayConfig, TeamConfig, get_gateway_config
+from app.core.config import TeamConfig
 
 
 def hash_api_key(raw_api_key: str) -> str:
@@ -31,10 +27,11 @@ def hash_api_key(raw_api_key: str) -> str:
 
 
 async def resolve_team(
+    request: Request,
     x_gateway_api_key: str = Header(..., alias="X-Gateway-API-Key"),
 ) -> TeamConfig:
-    config: GatewayConfig = get_gateway_config()
-    team = config.team_by_api_key_hash(hash_api_key(x_gateway_api_key))
+    store = request.app.state.team_store
+    team = await store.team_by_api_key_hash(hash_api_key(x_gateway_api_key))
     if team is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

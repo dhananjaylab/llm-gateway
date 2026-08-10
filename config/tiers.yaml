@@ -1,0 +1,46 @@
+# Abstract model-tier -> fallback-chain mapping (Phase 3).
+#
+# A client requests a TIER, not a specific vendor model (e.g.
+# "model": "tier-1-reasoning" instead of "model": "openai:gpt-5.4"), and
+# the gateway walks `chain` in order, per app/resilience/fallback.py:
+# retry the current link with backoff, and on exhaustion/an open circuit
+# advance to the next link, transparently to the caller (Document 03,
+# Journey B).
+#
+# A team must still have the tier name itself in its `allowed_models`
+# (config/teams.yaml / the Admin API) to request it — tiers don't bypass
+# the existing per-team model allow-list, they're just another kind of
+# entry in it. Literal "provider:model" ids (Phase 1/2 style) keep working
+# unchanged: anything not found as a key below is treated as its own
+# one-link "chain", so a literal request never gets surprise fallback
+# behavior it didn't ask for.
+#
+# VERSION NOTE / SCOPE NOTE (Phase 3 delivery): chains below deliberately
+# reuse the exact model identifiers already pinned in config/pricing.yaml
+# and config/teams.yaml (gpt-5.4, claude-sonnet-5, claude-haiku-4-5,
+# llama3.2) rather than adopting newer releases (e.g. OpenAI's GPT-5.6
+# "Sol/Terra/Luna" family, GA July 2026) — upgrading the served model
+# roster is a product decision independent of this phase's mandate
+# (resilience, not model selection) and would also need new
+# config/pricing.yaml rows. Flagged here as a suggested follow-up, not
+# decided silently.
+#
+# Gemini is deliberately NOT in any chain here: GeminiAdapter.stream()
+# always raises a non-retryable ProviderError (Gemini streaming isn't
+# implemented — see app/providers/gemini_adapter.py), and this gateway's
+# fallback rule for non-retryable errors is "bubble up immediately, try
+# no further links" (Document 03, confirmed as the literal reading during
+# Phase 3 sign-off). Placing Gemini mid-chain would mean any streaming
+# request that reached it aborted the whole chain walk right there,
+# regardless of what came after. Gemini remains fully usable as a literal
+# "gemini:gemini-3.6-flash" model id (non-streaming), unaffected by tiers.
+
+tiers:
+  tier-1-reasoning:
+    chain: ["openai:gpt-5.4", "anthropic:claude-sonnet-5", "ollama:llama3.2"]
+
+  tier-2-fast:
+    chain: ["anthropic:claude-haiku-4-5", "ollama:llama3.2"]
+
+  tier-3-local:
+    chain: ["ollama:llama3.2"]

@@ -38,8 +38,18 @@ _DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "teams.y
 _DEFAULT_PRICING_PATH = Path(__file__).resolve().parents[2] / "config" / "pricing.yaml"
 _DEFAULT_TIERS_PATH = Path(__file__).resolve().parents[2] / "config" / "tiers.yaml"
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_last_loaded_dotenv_root: Path | None = None
 
-load_dotenv(_PROJECT_ROOT / ".env", override=False)
+
+def _load_project_dotenv(force: bool = False) -> None:
+    global _last_loaded_dotenv_root
+    if not force and _last_loaded_dotenv_root == _PROJECT_ROOT:
+        return
+    load_dotenv(_PROJECT_ROOT / ".env", override=False)
+    _last_loaded_dotenv_root = _PROJECT_ROOT
+
+
+_load_project_dotenv()
 
 
 class TeamPolicy(BaseModel):
@@ -102,7 +112,6 @@ class ProviderSettings(BaseModel):
 
 @lru_cache(maxsize=1)
 def get_provider_settings() -> ProviderSettings:
-    load_dotenv(_PROJECT_ROOT / ".env", override=False)
     return ProviderSettings(
         openai_api_key=os.environ.get("OPENAI_API_KEY"),
         openai_base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com"),
@@ -224,7 +233,6 @@ class GatewaySettings(BaseModel):
 
 @lru_cache(maxsize=1)
 def get_gateway_settings() -> GatewaySettings:
-    load_dotenv(_PROJECT_ROOT / ".env", override=False)
     return GatewaySettings(
         redis_url=os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
         gateway_admin_key=os.environ.get("GATEWAY_ADMIN_KEY"),

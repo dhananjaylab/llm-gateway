@@ -95,4 +95,10 @@ def all_configured_provider_models(model_ids: list[str]) -> list[tuple[str, str,
 
 def reset_registry_cache() -> None:
     """Test-only hook: clear the memoized adapter singletons."""
+    # Also clear the provider settings cache so tests that manipulate
+    # environment variables (via `monkeypatch.delenv`) get a fresh
+    # `ProviderSettings` instance when `_adapters()` is next called.
+    from app.core.config import reset_provider_settings_cache
+
     _adapters.cache_clear()
+    reset_provider_settings_cache()

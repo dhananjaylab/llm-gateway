@@ -3,7 +3,16 @@ test_streaming_passthrough.py
 
 Verifies: "SSE chunks arrive at the client in order and unmodified in
 content; TTFT is captured; a mocked mid-stream client disconnect cancels
-the upstream call" — per the Phase 1 test plan.
+the upstream call" — per the Phase 1 test plan, still true in Phase 3.
+
+Phase 3 change: `_stream_response` now takes `fallback_router` + `chain`
+instead of a bare `adapter` + `provider_model` (see app/api/v1_chat.py's
+module docstring). The disconnect test below builds a real
+`FallbackRouter` wired with `app.resilience.stub.CircuitBreaker` (the
+Phase 1 always-Closed stub, kept around for exactly this — see its
+docstring) and a single-attempt `RetryPolicy`, rather than a
+fakeredis-backed one: this test is about disconnect handling, not
+circuit-breaker/retry mechanics, so keeping it Redis-free is deliberate.
 """
 
 from __future__ import annotations
@@ -12,7 +21,11 @@ import json
 import logging
 
 from app.api.v1_chat import _stream_response
+from app.core.config import TiersConfig
 from app.core.schema import ChatMessage, UnifiedChatRequest
+from app.resilience.fallback import FallbackRouter
+from app.resilience.retry import RetryPolicy
+from app.resilience.stub import CircuitBreaker as AlwaysClosedCircuitBreaker
 from tests.unit.conftest import DATA_SCIENCE_KEY, FakeAdapter
 
 
@@ -114,10 +127,24 @@ class _NoopBudgetEnforcer:
         return None
 
 
-async def test_client_disconnect_cancels_the_upstream_call():
+def _redis_free_fallback_router() -> FallbackRouter:
+    """A FallbackRouter with no Redis dependency at all: the always-Closed
+    circuit-breaker stub (never denies, never touches Redis) and a
+    single-attempt retry policy (this test's adapter never fails, so
+    retries are irrelevant to what's being verified)."""
+    return FallbackRouter(
+        circuit_breaker=AlwaysClosedCircuitBreaker(),
+        retry_policy=RetryPolicy(max_attempts=1),
+        tiers_config=TiersConfig(tiers={}),
+    )
+
+
+async def test_client_disconnect_cancels_the_upstream_call(monkeypatch):
     from app.core.config import TeamConfig, TeamPolicy
 
     adapter = _TrackingAdapter()
+    monkeypatch.setattr("app.api.v1_chat.resolve_model", lambda model_id: (adapter, "gpt-5.4-served"))
+
     fake_request = _FakeDisconnectingRequest(disconnect_after=1)
     unified_request = UnifiedChatRequest(
         model="openai:gpt-5.4", messages=[ChatMessage(role="user", content="hi")], stream=True
@@ -129,13 +156,14 @@ async def test_client_disconnect_cancels_the_upstream_call():
         policy=TeamPolicy(),
     )
     rate_limiter = _NoopRateLimiter()
+    fallback_router = _redis_free_fallback_router()
 
-    received: list = []  # list[ServerSentEvent], the shape _stream_response yields
+    received: list = []  # list[str], the SSE-frame strings _stream_response yields
     async for event in _stream_response(
-        adapter=adapter,
-        payload={},
+        fallback_router=fallback_router,
+        chain=["openai:gpt-5.4"],
+        tier_or_model="openai:gpt-5.4",
         request=unified_request,
-        provider_model="gpt-5.4-served",
         http_request=fake_request,
         team=team,
         reserved_tokens=42,
@@ -152,9 +180,13 @@ async def test_client_disconnect_cancels_the_upstream_call():
     # completion (5 content chunks + 1 terminal usage chunk = 6 total).
     assert adapter.yielded_count < 6
     # And its cleanup path (aclose()) ran, proving the upstream call was
-    # actually cancelled rather than left dangling.
+    # actually cancelled rather than left dangling — FallbackRouter's own
+    # `finally: await agen.aclose()` (app/resilience/fallback.py) closes
+    # the raw adapter stream when v1_chat.py's outer `agen.aclose()` (also
+    # a `finally`) closes the fallback-aware wrapper generator around it.
     assert adapter.stream_closed is True
-    # Phase 2: the reservation is still reconciled (refunded) even though
-    # the stream was cut short — actual_tokens=0 since no usage chunk
-    # ever arrived (the terminal usage chunk was never reached).
+    # Phase 2 behavior, unchanged: the reservation is still reconciled
+    # (refunded) even though the stream was cut short — actual_tokens=0
+    # since no usage chunk ever arrived (the terminal usage chunk was
+    # never reached).
     assert rate_limiter.reconcile_calls == [(42, 0)]

@@ -20,6 +20,20 @@ this API — PATCH only ever updates an *existing* team's limits/budget and
 operation (see scripts/hash_api_key.py + scripts/seed_teams.py for the
 current manual path); wiring a POST /admin/teams is a natural, small
 Phase 5/6 addition once the demo-team-seeding story in Phase 5 needs it.
+
+Phase 3 addition: GET /admin/health and GET /admin/circuits, read-only,
+same admin-key gate as everything else here. Not spelled out in Document
+03's Phase 3 surface inventory (that document only lists /admin/limits,
+/admin/budgets, /admin/audit) — added on top per explicit developer
+sign-off ahead of Phase 4's Grafana Operations dashboard, so Phase 3's
+own done criteria ("a simulated provider outage results in the client
+receiving 200 from the fallback, end-to-end") can be verified by hand
+without waiting for Phase 4. Both endpoints report on every provider-model
+pair reachable from config/tiers.yaml's chains (deduplicated,
+unconfigured providers silently skipped — see
+app/providers/registry.py::all_configured_provider_models), not on
+whatever a client happened to request recently, so an admin can see a
+provider's state even if nothing has called it yet this process lifetime.
 """
 
 from __future__ import annotations
@@ -30,6 +44,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from app.core.config import get_gateway_settings
+from app.providers.registry import all_configured_provider_models
 
 logger = logging.getLogger("gateway.admin")
 
@@ -210,3 +225,69 @@ async def get_audit(
 ) -> list[AuditEntryView]:
     entries = await request.app.state.audit_log.recent(limit=limit)
     return [AuditEntryView(**e) for e in entries]
+
+
+# -- Phase 3: health + circuits (read-only, ahead of Phase 4 Grafana) --------
+
+
+class HealthStatusView(BaseModel):
+    provider: str
+    model: str
+    state: str  # "healthy" | "degraded" | "down" | "unknown"
+    sample_count: int
+    error_rate: float | None
+    p99_latency_ms: float | None
+    last_checked_at: float | None
+
+
+class CircuitStatusView(BaseModel):
+    provider: str
+    model: str
+    state: str  # "closed" | "open" | "half_open"
+    opened_at: float | None
+    failures_in_window: int
+    window_size: int
+
+
+def _known_provider_models(request: Request) -> list[tuple[str, str]]:
+    """Every (provider, model) pair reachable from config/tiers.yaml's
+    chains in this environment, deduplicated, skipping any provider whose
+    API key isn't configured."""
+    tiers_config = request.app.state.tiers_config
+    resolved = all_configured_provider_models(tiers_config.all_links())
+    return [(provider, model) for _model_id, provider, model in resolved]
+
+
+@router.get("/health", response_model=list[HealthStatusView])
+async def get_health(request: Request, actor: str = Depends(require_admin)) -> list[HealthStatusView]:
+    tracker = request.app.state.health_tracker
+    statuses = await tracker.list_status(_known_provider_models(request))
+    return [
+        HealthStatusView(
+            provider=s.provider,
+            model=s.model,
+            state=s.state,
+            sample_count=s.sample_count,
+            error_rate=s.error_rate,
+            p99_latency_ms=s.p99_latency_ms,
+            last_checked_at=s.last_checked_at,
+        )
+        for s in statuses
+    ]
+
+
+@router.get("/circuits", response_model=list[CircuitStatusView])
+async def get_circuits(request: Request, actor: str = Depends(require_admin)) -> list[CircuitStatusView]:
+    circuit_breaker = request.app.state.circuit_breaker
+    statuses = await circuit_breaker.list_status(_known_provider_models(request))
+    return [
+        CircuitStatusView(
+            provider=s.provider,
+            model=s.model,
+            state=s.state,
+            opened_at=s.opened_at,
+            failures_in_window=s.failures_in_window,
+            window_size=s.window_size,
+        )
+        for s in statuses
+    ]

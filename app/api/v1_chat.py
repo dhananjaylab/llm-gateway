@@ -1,26 +1,48 @@
 """
 POST /v1/chat/completions and GET /v1/models.
 
-Phase 2 pipeline (stages 1, 3, 5-7 unchanged from Phase 1; stage 4's
-permissive stub is now real enforcement, and budget enforcement is
-inserted before it per Document 03's Journey C: reject before any
-upstream provider call is made, in cost order — budget first since it's
-a read-only check, then rate limiting which mutates shared state):
+Phase 3 pipeline (stages 1-5 unchanged from Phase 2; stage 6's permissive
+stub is now the real Redis-backed circuit breaker, reached through the
+fallback router rather than called directly, and stage 7 can now mean
+"walk a multi-provider chain with retries", not just "call one adapter"):
 
   1. deserialize + validate (FastAPI/Pydantic)
-  2. authenticate -> TeamConfig                    [resolve_team, now Redis-backed]
+  2. authenticate -> TeamConfig
   3. enforce model allow-list                       [enforce_model_allowed]
-  4a. budget precheck (fail-closed)                 [BudgetEnforcer.precheck]
+  4a. budget precheck (fail-closed)                  [BudgetEnforcer.precheck]
   4b. rate limit check (Redis token bucket,          [RateLimiter.check /
-      or batch priority queueing)                    BatchPriorityQueue.run_with_queueing]
+      or batch priority queueing)                     BatchPriorityQueue.run_with_queueing]
   5. policy injection                                [apply_policy]
-  6. circuit-breaker check (stub: always Closed)     [CircuitBreaker.allow_request]
-  7. resolve provider + translate + execute          [registry.resolve_model, adapter]
-  8. translate response, reconcile reservation,      [adapter, RateLimiter.reconcile,
-     record actual spend                              BudgetEnforcer.record_spend]
+  6. resolve tier -> fallback chain                  [FallbackRouter.resolve_chain]
+  7. walk the chain: circuit check, retry w/ backoff, [FallbackRouter.execute_non_streaming /
+     failover to next link                            .stream_with_fallback]
+  8. translate response, reconcile reservation,       [adapter, RateLimiter.reconcile,
+     record actual spend, record passive health        BudgetEnforcer.record_spend,
+                                                         HealthTracker.record_outcome (inside
+                                                         the fallback router)]
 
-Streaming/non-streaming dispatch logic (StreamingResponse vs. direct
-return) is unchanged from Phase 1 — see the VERSION NOTE preserved below.
+Two behavioral changes from Phase 2, both flowing directly from the new
+routing hierarchy (Document 05):
+
+- A request that used to bubble up as a flat 502 on adapter failure can
+  now surface as a 503 with a structured "which providers were tried"
+  body (`FallbackExhaustedError`) once retries+fallback are exhausted —
+  this only changes observable behavior for requests whose model resolves
+  to more than a trivially-exhausted single link, or where retries were
+  attempted; a single always-failing adapter with the historic
+  single-link-only chain now also gets retried up to
+  `RETRY_MAX_ATTEMPTS` times before that 503, where Phase 2 failed fast
+  on the first error.
+- A non-retryable provider error (401/400/403) still surfaces as a 502
+  immediately (Document 03's HTTP status contract table lists 502 for a
+  provider-side failure bubbled as-is) — that part is unchanged; what's
+  new is that Phase 3 GUARANTEES no fallback was attempted for it,
+  whereas Phase 2 had no fallback concept to begin with.
+
+VERSION NOTE (unchanged from Phase 1): still a hand-formatted
+`StreamingResponse`, not `fastapi.sse.EventSourceResponse` — see the
+original Phase 1 reasoning preserved in git history; nothing about
+Phase 3 changes that trade-off.
 """
 
 from __future__ import annotations
@@ -41,17 +63,27 @@ from app.providers.base import ProviderError
 from app.providers.registry import UnknownProviderError, resolve_model
 from app.ratelimit.budget import BudgetUnavailableError
 from app.ratelimit.estimator import estimate_reserved_tokens
-from app.resilience.stub import CircuitBreaker
+from app.resilience.fallback import FallbackExhaustedError
 
 logger = logging.getLogger("gateway.v1_chat")
 
 router = APIRouter()
 
-_circuit_breaker = CircuitBreaker()
-
 
 def _provider_error_response(exc: ProviderError) -> dict:
     return {"error": {"type": exc.error_type, "message": exc.message}}
+
+
+def _fallback_exhausted_response(exc: FallbackExhaustedError) -> dict:
+    return {
+        "error": {
+            "type": "fallback_chain_exhausted",
+            "message": str(exc),
+            "tier_or_model": exc.tier_or_model,
+            "chain": exc.chain,
+            "attempts": [a.as_dict() for a in exc.attempts],
+        }
+    }
 
 
 @router.post(
@@ -72,6 +104,7 @@ async def chat_completions(
     budget_enforcer = app_state.budget_enforcer
     batch_queue = app_state.batch_queue
     pricing_table = app_state.pricing
+    fallback_router = app_state.fallback_router
 
     # -- stage 4a: budget precheck (fail-closed; read-only, so a rejection
     # here never needs to roll anything back) ------------------------------
@@ -137,40 +170,18 @@ async def chat_completions(
 
     enriched_request = apply_policy(request, team)
 
-    try:
-        adapter, provider_model = resolve_model(enriched_request.model)
-    except UnknownProviderError as exc:
-        # Reservation was made but the request can go no further — refund
-        # it immediately rather than letting it sit until TTL.
-        await rate_limiter.reconcile(team=team, reserved_tokens=estimated_tokens, actual_tokens=0)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": {"type": "unknown_provider", "message": str(exc)}},
-        ) from exc
-
-    if not await _circuit_breaker.allow_request(
-        provider=adapter.provider_name, model=provider_model
-    ):
-        await rate_limiter.reconcile(team=team, reserved_tokens=estimated_tokens, actual_tokens=0)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={
-                "error": {
-                    "type": "circuit_open",
-                    "message": f"{adapter.provider_name}:{provider_model} circuit is open.",
-                }
-            },
-        )
-
-    payload = adapter.translate_request(enriched_request, provider_model=provider_model)
+    # -- stage 6: resolve the request's model/tier into an ordered chain ----
+    # A literal "provider:model" id (Phase 1/2 style) resolves to a
+    # one-element chain containing itself — see FallbackRouter.resolve_chain.
+    chain = fallback_router.resolve_chain(enriched_request.model)
 
     if enriched_request.stream:
         return StreamingResponse(
             _stream_response(
-                adapter=adapter,
-                payload=payload,
+                fallback_router=fallback_router,
+                chain=chain,
+                tier_or_model=enriched_request.model,
                 request=enriched_request,
-                provider_model=provider_model,
                 http_request=http_request,
                 team=team,
                 reserved_tokens=estimated_tokens,
@@ -187,16 +198,39 @@ async def chat_completions(
             },
         )
 
+    # -- stage 7: walk the fallback chain (circuit check, retry, failover) --
     try:
-        raw = await adapter.call(payload)
+        adapter, provider_model, raw = await fallback_router.execute_non_streaming(
+            chain=chain,
+            resolve_fn=resolve_model,
+            enriched_request=enriched_request,
+            tier_or_model=enriched_request.model,
+        )
+    except UnknownProviderError as exc:
+        # Reservation was made but the request can go no further — refund
+        # it immediately rather than letting it sit until TTL. Identical
+        # to Phase 1/2's behavior for a literal unconfigured-provider
+        # request (a one-link chain that fails to resolve raises this
+        # same exception type).
+        await rate_limiter.reconcile(team=team, reserved_tokens=estimated_tokens, actual_tokens=0)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": {"type": "unknown_provider", "message": str(exc)}},
+        ) from exc
     except ProviderError as exc:
-        await _circuit_breaker.record_failure(provider=adapter.provider_name, model=provider_model)
+        # A non-retryable error bubbled straight through the chain walk —
+        # Document 03: never retried, never triggers fallback.
         await rate_limiter.reconcile(team=team, reserved_tokens=estimated_tokens, actual_tokens=0)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY, detail=_provider_error_response(exc)
         ) from exc
+    except FallbackExhaustedError as exc:
+        await rate_limiter.reconcile(team=team, reserved_tokens=estimated_tokens, actual_tokens=0)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=_fallback_exhausted_response(exc),
+        ) from exc
 
-    await _circuit_breaker.record_success(provider=adapter.provider_name, model=provider_model)
     unified = adapter.translate_response(raw, request=enriched_request, provider_model=provider_model)
 
     await rate_limiter.reconcile(
@@ -207,16 +241,19 @@ async def chat_completions(
     budget_result = await budget_enforcer.record_spend(team, cost_usd)
     if budget_result.warning_fraction is not None:
         response.headers["X-Budget-Warning"] = f"{budget_result.warning_fraction:.2f}"
+    # Which provider:model actually served this — meaningful now that it
+    # isn't necessarily the one literally named in the request.
+    response.headers["X-Gateway-Served-Model"] = f"{adapter.provider_name}:{provider_model}"
 
     return unified
 
 
 async def _stream_response(
     *,
-    adapter,
-    payload: dict,
+    fallback_router,
+    chain: list[str],
+    tier_or_model: str,
     request: UnifiedChatRequest,
-    provider_model: str,
     http_request: Request,
     team: TeamConfig,
     reserved_tokens: int,
@@ -225,26 +262,44 @@ async def _stream_response(
     pricing_table,
 ):
     """
-    Dual-pipeline streaming, unchanged from Phase 1 in shape: forward each
-    normalized chunk to the client as soon as it arrives, while a client
-    disconnect cancels the upstream call. New in Phase 2: the terminal
-    usage chunk (once known) drives reservation reconciliation and actual
-    budget spend recording — both best-effort with respect to the SSE
-    stream itself (a Redis hiccup here must never surface as a broken
-    stream to a client that already received a complete answer).
+    Dual-pipeline streaming: forward each normalized chunk to the client
+    as soon as it arrives, while a client disconnect cancels the upstream
+    call. The terminal usage chunk (once known) drives reservation
+    reconciliation and actual budget spend recording — both best-effort
+    with respect to the SSE stream itself.
+
+    Phase 3 change: `agen` is now `fallback_router.stream_with_fallback(...)`
+    instead of a single adapter's `.stream(...)` directly — everything
+    below this line is otherwise unchanged from Phase 1/2, including the
+    exception handling: `stream_with_fallback` re-raises `ProviderError`
+    for exactly the same two cases Phase 1/2 already handled (a
+    non-retryable failure, or — new in Phase 3 — a post-first-chunk
+    mid-stream failure after fallback has already committed to a
+    provider), so the `except ProviderError` branch below needs no
+    changes to keep producing the same `event: error` SSE frame. A
+    `FallbackExhaustedError` (every link failed before any content was
+    sent) is the one new case Phase 3 adds here — surfaced the same way,
+    since headers already committed a 200 and an SSE error frame is the
+    only channel left to report it on.
     """
     start = time.perf_counter()
     first_chunk_logged = False
     final_usage: Usage | None = None
-    final_model_served = provider_model
+    final_provider = None
+    final_model_served = None
 
-    agen = adapter.stream(payload, request=request, provider_model=provider_model)
+    agen = fallback_router.stream_with_fallback(
+        chain=chain,
+        resolve_fn=resolve_model,
+        enriched_request=request,
+        tier_or_model=tier_or_model,
+    )
     try:
         async for chunk in agen:
             if await http_request.is_disconnected():
                 logger.info(
                     "client disconnected mid-stream, cancelling upstream call",
-                    extra={"team_id": team.team_id, "provider": adapter.provider_name},
+                    extra={"team_id": team.team_id, "provider": chunk.provider},
                 )
                 break
 
@@ -254,32 +309,35 @@ async def _stream_response(
                     "time_to_first_token",
                     extra={
                         "team_id": team.team_id,
-                        "provider": adapter.provider_name,
+                        "provider": chunk.provider,
                         "model_served": chunk.model_served,
                         "ttft_ms": round(ttft_ms, 1),
                     },
                 )
                 first_chunk_logged = True
 
+            final_provider = chunk.provider
+            final_model_served = chunk.model_served
             if chunk.usage is not None:
                 final_usage = chunk.usage
-                final_model_served = chunk.model_served
 
             yield f"data: {chunk.model_dump_json()}\n\n"
-    except ProviderError as exc:
-        await _circuit_breaker.record_failure(provider=adapter.provider_name, model=provider_model)
-        await rate_limiter.reconcile(team=team, reserved_tokens=reserved_tokens, actual_tokens=0)
-        yield f"event: error\ndata: {json.dumps(_provider_error_response(exc))}\n\n"
+    except (ProviderError, FallbackExhaustedError) as exc:
+        actual_tokens = final_usage.total_tokens if final_usage else 0
+        await rate_limiter.reconcile(team=team, reserved_tokens=reserved_tokens, actual_tokens=actual_tokens)
+        if isinstance(exc, FallbackExhaustedError):
+            yield f"event: error\ndata: {json.dumps(_fallback_exhausted_response(exc))}\n\n"
+        else:
+            yield f"event: error\ndata: {json.dumps(_provider_error_response(exc))}\n\n"
         return
     else:
-        await _circuit_breaker.record_success(provider=adapter.provider_name, model=provider_model)
         actual_tokens = final_usage.total_tokens if final_usage else 0
         await rate_limiter.reconcile(
             team=team, reserved_tokens=reserved_tokens, actual_tokens=actual_tokens
         )
-        if final_usage is not None:
+        if final_usage is not None and final_provider is not None:
             cost_usd = calculate_cost_usd(
-                pricing_table, adapter.provider_name, final_model_served, final_usage
+                pricing_table, final_provider, final_model_served, final_usage
             )
             await budget_enforcer.record_spend(team, cost_usd)
     finally:

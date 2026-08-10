@@ -1,24 +1,23 @@
 """
-Phase 1 circuit-breaker stub.
+Phase 1 circuit-breaker stub — SUPERSEDED by app/resilience/circuit_breaker.py
+as of Phase 3. `app/api/v1_chat.py` no longer imports this file.
 
-Always reports Closed (i.e. "allow the call"). Phase 3 replaces
-`CircuitBreaker` with a Redis-backed three-state state machine
-(circuit:{provider}:{model}, per Document 05) implementing this same
-`allow_request` / `record_success` / `record_failure` signature, so
-app/api/v1_chat.py's call sites do not change shape — only which object
-they're calling.
-
-No retry-with-backoff or fallback-chain resolution exists in Phase 1
-either; a failed provider call simply bubbles up as an error response.
-Phase 3 adds app/resilience/fallback.py and app/resilience/health.py
-alongside this file.
+Retained (not deleted) for the same two reasons app/ratelimit/stub.py was
+kept after Phase 2: it's the cleanest possible reference for the
+interface `CircuitBreaker` had to preserve (`allow_request()` /
+`record_success()` / `record_failure()` — Phase 3's real implementation
+keeps the same method signatures, per this file's own original docstring:
+"app/api/v1_chat.py's call sites do not change shape — only which object
+they're calling"), and it remains a handy always-Closed test double for
+tests that want to exercise something else without also standing up
+Redis/fakeredis for circuit state.
 """
 
 from __future__ import annotations
 
 
 class CircuitBreaker:
-    """Always Closed. No failure tracking, no cooldown, no half-open probe yet."""
+    """Always Closed. No failure tracking, no cooldown, no half-open probe."""
 
     async def allow_request(self, *, provider: str, model: str) -> bool:
         return True

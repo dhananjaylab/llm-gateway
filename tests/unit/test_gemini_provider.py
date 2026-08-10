@@ -88,6 +88,7 @@ def test_provider_settings_load_from_dotenv(monkeypatch, tmp_path):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     (tmp_path / ".env").write_text("GEMINI_API_KEY=from-dotenv-test-key\n")
     monkeypatch.setattr(config_module, "_PROJECT_ROOT", tmp_path)
+    config_module._load_project_dotenv(force=True)
     config_module.reset_provider_settings_cache()
 
     settings = config_module.get_provider_settings()

@@ -3,9 +3,11 @@ test_auth.py
 
 Verifies: "Valid key -> 200 path continues; invalid key -> 401; valid key,
 disallowed model -> 403" — per the Phase 1 test plan, still true in
-Phase 2 (auth itself didn't change shape, only its data source: Redis via
-TeamConfigStore instead of a static in-memory YAML dict — see
-app/core/auth.py's docstring).
+Phase 3. NOTE: the monkeypatch target stays `app.api.v1_chat.resolve_model`
+even though Phase 3's fallback router is what actually calls it now —
+v1_chat.py passes its own module-level `resolve_model` name into the
+fallback executor on every request, so overriding that name here still
+takes effect. See app/resilience/fallback.py's module docstring.
 """
 
 from __future__ import annotations
@@ -63,6 +65,10 @@ def test_valid_key_allowed_model_reaches_the_provider_adapter(client, monkeypatc
     # Phase 2: successful requests now carry rate-limit headers.
     assert "X-RateLimit-Remaining-RPM" in resp.headers
     assert "X-RateLimit-Remaining-TPM" in resp.headers
+    # Phase 3: successful requests also carry which provider:model actually
+    # served the request (useful once fallback can mean it isn't the one
+    # literally named in the request).
+    assert resp.headers["X-Gateway-Served-Model"] == "fake:gpt-5.4-served"
 
 
 def test_unknown_provider_prefix_returns_400(client, monkeypatch):
@@ -70,16 +76,6 @@ def test_unknown_provider_prefix_returns_400(client, monkeypatch):
     Simulate a model string with a provider prefix that has no configured
     adapter (e.g. its API key was never set) — registry.resolve_model
     raises UnknownProviderError, which the route maps to 400.
-
-    Phase 1 exercised this by mutating team_config in-place via the
-    process-global YAML config object. Phase 2 moved team config into
-    Redis (see app/core/team_store.py), and Admin API's PATCH surface
-    deliberately does not expose allowed_models (out of scope — see
-    app/api/admin.py's module docstring), so there is no supported way to
-    add a bogus model to a seeded team's allow-list from outside. Bypass
-    the allow-list check directly instead — this still exercises exactly
-    the thing the test is about (registry's 400 branch), without a
-    dependency on how team config happens to be stored.
     """
     monkeypatch.setattr("app.api.v1_chat.enforce_model_allowed", lambda team, model_id: None)
 

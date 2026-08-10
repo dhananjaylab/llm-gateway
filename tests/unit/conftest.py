@@ -37,9 +37,19 @@ def _reset_singleton_caches(monkeypatch):
     Every cached singleton (provider settings, gateway settings, adapter
     registry) is process-lifetime by design (see app/core/config.py's
     lru_cache usage). Tests must not leak state between each other, so
-    reset before *and* after. Team config itself no longer lives in an
-    in-memory singleton as of Phase 2 — it lives in the per-test
-    `fake_redis` instance, which is naturally isolated per test already.
+    reset before *and* after.
+
+    Phase 3: HEALTH_CHECK_ENABLED is forced to "false" here even though
+    the shipped .env.example default is "true" (per the TRD's own
+    recommendation for production). The background health prober makes
+    real HTTP calls to whatever providers are configured; every provider
+    key in this test suite is a fake string ("test-openai-key" etc.), so
+    letting it run would mean every test process spends real wall-clock
+    time making doomed HTTP calls to api.openai.com et al. on a
+    background task, which is slow, flaky, and not what any of these
+    tests are trying to verify. Tests that specifically exercise the
+    prober (test_health_checking.py) turn it on explicitly and swap in a
+    FakeAdapter-backed registry.
     """
     monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
@@ -49,6 +59,20 @@ def _reset_singleton_caches(monkeypatch):
     monkeypatch.setenv("RATE_LIMIT_FAIL_OPEN", "true")
     monkeypatch.setenv("BATCH_QUEUE_MAX_WAIT_SECONDS", "1.5")
     monkeypatch.setenv("BATCH_QUEUE_POLL_INTERVAL_SECONDS", "0.05")
+    monkeypatch.setenv("HEALTH_CHECK_ENABLED", "false")
+    monkeypatch.setenv("HEALTH_CHECK_INTERVAL_SECONDS", "30")
+    monkeypatch.setenv("CIRCUIT_BREAKER_FAILURE_THRESHOLD", "5")
+    monkeypatch.setenv("CIRCUIT_BREAKER_WINDOW_SIZE", "10")
+    # Production default is 60s (see .env.example); tests use a short
+    # cooldown so an end-to-end Open -> Half-Open -> Closed test
+    # (test_fallback_chain.py) can wait it out in real wall-clock time
+    # without slowing the suite down. Tests that need to assert on the
+    # *cooldown-not-yet-elapsed* window use a directly-constructed
+    # CircuitBreaker with an injectable clock instead (test_circuit_breaker.py).
+    monkeypatch.setenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "0.2")
+    monkeypatch.setenv("RETRY_MAX_ATTEMPTS", "3")
+    monkeypatch.setenv("RETRY_BASE_DELAY_SECONDS", "0.01")
+    monkeypatch.setenv("RETRY_MAX_DELAY_SECONDS", "0.05")
 
     config_module.reset_config_cache()
     config_module.reset_provider_settings_cache()
@@ -65,8 +89,8 @@ def _reset_singleton_caches(monkeypatch):
 def fake_redis() -> fakeredis.FakeAsyncRedis:
     """
     A fresh, isolated in-memory Redis double per test (no shared
-    FakeServer, so tests never see each other's rate-limit/budget state).
-    `decode_responses=True` matches production (see redis_client.py).
+    FakeServer, so tests never see each other's rate-limit/budget/circuit
+    state). `decode_responses=True` matches production (see redis_client.py).
     """
     return fakeredis.FakeAsyncRedis(decode_responses=True)
 
@@ -81,8 +105,9 @@ def app(fake_redis: fakeredis.FakeAsyncRedis) -> FastAPI:
 @pytest.fixture
 def client(app: FastAPI) -> TestClient:
     # Used as a context manager so FastAPI's lifespan (Redis wiring, team
-    # seeding, the config-change pub/sub listener) actually runs — a bare
-    # `TestClient(app)` does not trigger startup/shutdown events.
+    # seeding, the config-change pub/sub listener, Phase 3's health
+    # checker task) actually runs — a bare `TestClient(app)` does not
+    # trigger startup/shutdown events.
     with TestClient(app) as c:
         yield c
 
@@ -98,10 +123,7 @@ async def running_app_client(app: FastAPI) -> AsyncIterator[AsyncClient]:
     True-concurrency test helper: runs the app's lifespan and hands back
     an httpx.AsyncClient wired directly to the ASGI app (no network, no
     thread pool). Tests that need real `asyncio.gather()`-level
-    concurrency (test_token_bucket_concurrency.py, test_priority_queue.py)
-    use this instead of the sync `client` fixture, since TestClient's
-    background-thread portal doesn't guarantee true interleaving the way
-    a single event loop's `asyncio.gather` does.
+    concurrency use this instead of the sync `client` fixture.
     """
     async with app.router.lifespan_context(app):
         transport = ASGITransport(app=app)
@@ -113,17 +135,16 @@ class FakeAdapter(ProviderAdapter):
     """
     Deterministic ProviderAdapter test double.
 
-    `usage_override`, new in Phase 2: if given, BOTH the non-streaming
-    `translate_response()` and the streaming terminal chunk report exactly
-    this Usage — for budget/reconciliation tests that need to control the
-    real cost/token count precisely. If omitted, behavior matches Phase 1
-    exactly: `translate_response()` reports a fixed Usage(10, 5), and the
-    streaming terminal chunk reports Usage(10, len(stream_chunks)) (i.e.
-    output_tokens tracks how many chunks were actually sent) — collapsing
-    these two into one shared default broke
-    test_stream_chunks_arrive_in_order_and_unmodified's output_tokens
-    assertion during this phase's own build, which is exactly the kind of
-    default-divergence this docstring exists to prevent recurring.
+    Phase 3 additions:
+    - `fail_times`: if > 0, `call()`/`stream()` raise a retryable
+      ProviderError this many times before succeeding — lets retry/
+      fallback tests script "fails twice, then works" without a real
+      network flake.
+    - `always_fail`: if True, every call raises (retryable unless
+      `retryable=False` is passed) — used to trip circuit breakers and to
+      exhaust whole fallback chains deterministically.
+    - `latency_seconds`: injected `asyncio.sleep()` before responding, so
+      health-check P99-latency tests don't need a real slow server.
     """
 
     provider_name = "fake"
@@ -134,6 +155,12 @@ class FakeAdapter(ProviderAdapter):
         response_text: str = "hello from fake adapter",
         stream_chunks: list[str] | None = None,
         usage_override: Usage | None = None,
+        fail_times: int = 0,
+        always_fail: bool = False,
+        retryable: bool = True,
+        error_type: str = "provider_error",
+        status_code: int | None = 500,
+        latency_seconds: float = 0.0,
     ) -> None:
         self.response_text = response_text
         self.stream_chunks = stream_chunks or ["Hel", "lo", "!"]
@@ -142,13 +169,35 @@ class FakeAdapter(ProviderAdapter):
         self.call_count = 0
         self.yielded_count = 0
         self.stream_closed = False
+        self.fail_times = fail_times
+        self.always_fail = always_fail
+        self.retryable = retryable
+        self.error_type = error_type
+        self.status_code = status_code
+        self.latency_seconds = latency_seconds
 
     def translate_request(self, request: UnifiedChatRequest, *, provider_model: str) -> dict:
         self.last_translated_request = request
         return {"model": provider_model, "messages": [m.content for m in request.messages]}
 
+    def _maybe_raise(self) -> None:
+        from app.providers.base import ProviderError
+
+        if self.always_fail or self.call_count <= self.fail_times:
+            raise ProviderError(
+                f"fake adapter scripted failure ({self.call_count}/{self.fail_times})",
+                status_code=self.status_code,
+                retryable=self.retryable,
+                error_type=self.error_type,
+            )
+
     async def call(self, payload: dict) -> dict:
+        import asyncio
+
         self.call_count += 1
+        if self.latency_seconds:
+            await asyncio.sleep(self.latency_seconds)
+        self._maybe_raise()
         return {"_fake_payload": payload}
 
     def translate_response(
@@ -173,7 +222,9 @@ class FakeAdapter(ProviderAdapter):
     async def stream(
         self, payload: dict, *, request: UnifiedChatRequest, provider_model: str
     ) -> AsyncIterator[UnifiedStreamChunk]:
+        self.call_count += 1
         try:
+            self._maybe_raise()
             for text in self.stream_chunks:
                 self.yielded_count += 1
                 yield UnifiedStreamChunk(

@@ -6,11 +6,13 @@ once, used only as the bootstrap seed for Redis. `TeamConfig` / `TeamPolicy`
 / `GatewayConfig` are unchanged in shape.
 
 Phase 3 additions:
-- `load_tiers_config()` / `get_tiers_config()`: loads config/tiers.yaml,
-  the tier-name -> ordered fallback-chain mapping app/resilience/fallback.py
-  resolves against. Cached with the same lru_cache + reset pattern as
-  every other config loader here, for the same reason (tests need a clean
-  slate between runs; production loads it once at boot).
+- `load_tiers_config()`: loads config/tiers.yaml, the tier-name -> ordered
+  fallback-chain mapping app/resilience/fallback.py resolves against.
+  Not cached (like load_pricing() before it) — app/main.py's lifespan
+  calls it once per app instance and stores the result on app.state, so
+  a second layer of caching here would just be dead weight, and tests
+  that build a fresh app per test (see tests/unit/conftest.py) get a
+  clean slate for free rather than needing an explicit cache reset.
 - `GatewaySettings` gains three new settings groups, all with defaults
   matching the TRD's own stated recommendations so the gateway is safe out
   of the box, and all overridable via environment variable without a code

@@ -63,7 +63,12 @@ def test_load_tiers_config_parses_the_chain_key_per_tier(tmp_path):
 def test_resolve_chain_expands_a_configured_tier_name(client):
     router = client.app.state.fallback_router
     chain = router.resolve_chain("tier-1-reasoning")
-    assert chain == ["openai:gpt-5.6-sol", "anthropic:claude-sonnet-5", "ollama:llama3.2"]
+    assert chain == [
+        "openai:gpt-5.6-sol",
+        "anthropic:claude-sonnet-5",
+        "ollama:llama3.2",
+        "gemini:gemini-3.6-flash",
+    ]
 
 
 def test_resolve_chain_treats_a_literal_model_id_as_its_own_one_link_chain(client):

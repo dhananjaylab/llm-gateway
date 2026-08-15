@@ -29,13 +29,15 @@ def test_get_health_lists_every_provider_model_pair_reachable_from_tiers_yaml(cl
 
     served = {(d["provider"], d["model"]) for d in data}
     # config/tiers.yaml's three chains, deduplicated (Phase 4 roster
-    # upgrade): openai:gpt-5.6-sol, anthropic:claude-sonnet-5,
-    # ollama:llama3.2, openai:gpt-5.6-terra, anthropic:claude-haiku-4-5.
+    # upgrade + Gemini late-chain fallback): openai:gpt-5.6-sol,
+    # anthropic:claude-sonnet-5, ollama:llama3.2, gemini:gemini-3.6-flash,
+    # openai:gpt-5.6-terra, anthropic:claude-haiku-4-5.
     assert ("openai", "gpt-5.6-sol") in served
     assert ("openai", "gpt-5.6-terra") in served
     assert ("anthropic", "claude-sonnet-5") in served
     assert ("anthropic", "claude-haiku-4-5") in served
     assert ("ollama", "llama3.2") in served
+    assert ("gemini", "gemini-3.6-flash") in served
 
     # Nothing has been called yet in this fresh test app — every pair
     # starts "unknown", not a false "healthy".

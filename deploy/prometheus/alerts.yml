@@ -1,0 +1,147 @@
+# Prometheus alert rules (TRD Phase 4 build task: "Configure alerts for:
+# provider error rate above threshold, team approaching budget cap,
+# latency P99 above SLA, and circuit breaker opening. Route alerts to
+# Slack with actionable context: what happened, which teams are
+# affected, and the auto-fallback status.")
+#
+# Written against the metrics in app/observability/metrics.py --
+# GatewayMetrics' 9 Document-05 metrics plus one flagged addition
+# (gen_ai_budget_utilization_ratio; see that module's docstring for why).
+#
+# THRESHOLDS mirror GatewaySettings' existing Phase 3 defaults, kept as-is
+# per explicit Phase 4 kickoff sign-off ("keep Phase 3's assumed
+# defaults"):
+#   - health_degraded_latency_p99_ms = 5000ms -> GatewayLatencyP99AboveSLA's 5.0s
+#   - budget_warn_fraction           = 0.8    -> TeamApproachingBudgetCap's 0.8
+# These are NOT read from the running gateway at rule-evaluation time --
+# Prometheus alert rules are static YAML, not templated against the app's
+# config -- so if those settings are ever retuned, update the numbers
+# below to match by hand. Same drift risk as any other infra-as-code
+# duplicated-constant; flagged rather than silently assumed to stay in
+# sync.
+#
+# CONTAINERIZATION NOTE: this file ships in Phase 4, as the TRD's own
+# build task literally asks for ("Write Prometheus alert rules in a YAML
+# file under deploy/prometheus/"). The Prometheus + Alertmanager
+# *containers* that actually load and evaluate it are Phase 5's
+# deliverable (Document 06 Phase 5: "Containerize the full stack") --
+# per explicit Phase 4 kickoff sign-off, docker-compose.yml stays
+# Redis-only until then. This file is inert (not mounted anywhere) until
+# that phase wires it in; tests/unit/test_alert_rule_syntax.py validates
+# its structure and metric-name references now, ahead of ever having a
+# real Prometheus to run `promtool check rules` against.
+#
+# "PROVIDER ERROR RATE ABOVE THRESHOLD" -- a documented gap: Document 05's
+# 9-metric table has no per-provider-CALL error counter
+# (gen_ai_requests_total is REQUEST-level -- a 429/402/400 there is a
+# client-side rejection, not a provider failure, and would falsely
+# inflate a naive "error rate" query). The two rules below approximate it
+# from what actually IS exported: circuit-breaker state (the precise,
+# authoritative signal -- a provider has crossed its own configured
+# failure threshold) and fallback-event frequency (a softer, earlier
+# warning -- a provider failing enough to trigger failover, even before
+# its circuit trips). Both are included rather than picking just one.
+
+groups:
+  - name: llm-gateway-operations
+    rules:
+      # "circuit breaker opening" -- TRD Phase 4 build task, verbatim.
+      # Document 05's gauge numbering: 2 = Open (NOT circuit_check.lua's
+      # own internal 0/1/2 -- see app/observability/metrics.py's module
+      # docstring before touching this expression).
+      - alert: CircuitBreakerOpen
+        expr: gen_ai_circuit_breaker_state == 2
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Circuit breaker OPEN for {{ $labels.provider }}/{{ $labels.model }}"
+          description: >-
+            {{ $labels.provider }}/{{ $labels.model }} has failed enough
+            recent calls to trip its circuit breaker open. The gateway is
+            now routing every request for this provider-model straight to
+            its configured fallback chain without attempting a network
+            call. Check the Operations dashboard's circuit-breaker state
+            timeline for how long this has been open and whether the
+            fallback chain is absorbing the load cleanly.
+
+      # Softer, earlier warning than the circuit actually tripping -- see
+      # the file header's "provider error rate" note.
+      - alert: ProviderFailoverRateHigh
+        expr: sum by (primary_provider) (rate(gen_ai_fallback_events_total[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.primary_provider }} is triggering fallback frequently"
+          description: >-
+            {{ $labels.primary_provider }} has triggered a fallback to the
+            next chain link more than 0.5 times/sec, averaged over 5
+            minutes. Requests are still succeeding via fallback (that's
+            what this metric measures) -- but this provider is degraded;
+            check whether it's about to cross its circuit-breaker
+            threshold too.
+
+      # "latency P99 above SLA" -- TRD Phase 4 build task, verbatim. 5.0s
+      # matches GatewaySettings.health_degraded_latency_p99_ms's Phase 3
+      # default (5000ms), kept as-is per Phase 4 sign-off.
+      - alert: GatewayLatencyP99AboveSLA
+        expr: >-
+          histogram_quantile(0.99,
+            sum by (le, provider, model) (rate(gen_ai_server_request_duration_seconds_bucket[5m]))
+          ) > 5.0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P99 latency for {{ $labels.provider }}/{{ $labels.model }} is above SLA"
+          description: >-
+            P99 end-to-end request latency for {{ $labels.provider }}/{{
+            $labels.model }} has exceeded 5.0s over the last 5 minutes.
+            This is total gateway-observed latency including any
+            retries/fallback the request needed, not raw upstream
+            latency -- check the Performance dashboard's latency-
+            percentile panel to see whether this is one slow provider or
+            gateway-side overhead.
+
+  - name: llm-gateway-business
+    rules:
+      # "team approaching budget cap" -- TRD Phase 4 build task, verbatim.
+      # Depends on gen_ai_budget_utilization_ratio, the one metric in this
+      # file that is NOT in Document 05's original 9 -- see
+      # app/observability/metrics.py's module docstring for why it had to
+      # be added for this rule to be expressible at all. 0.8 matches
+      # GatewaySettings.budget_warn_fraction's existing default.
+      - alert: TeamApproachingBudgetCap
+        expr: gen_ai_budget_utilization_ratio >= 0.8
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Team {{ $labels.team_id }} is at {{ $value | humanizePercentage }} of its budget cap"
+          description: >-
+            Team {{ $labels.team_id }} has spent {{ $value | humanizePercentage }}
+            of its current budget period's cap. Requests are still being
+            served -- the hard block is at 100%, not this warning
+            threshold -- this is the same crossing the gateway already
+            reports via the X-Budget-Warning response header on
+            individual requests, surfaced here for the Business
+            dashboard/Slack instead of per-request.
+
+      # A team that's already being blocked outright -- distinct from the
+      # warning above, and worth its own alert since "under 80% a minute
+      # ago, now getting 402s" usually means a burst, not a slow approach,
+      # and warrants a different response.
+      - alert: TeamBudgetExhausted
+        expr: increase(gen_ai_budget_applied_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Team {{ $labels.team_id }} is being blocked on budget"
+          description: >-
+            Team {{ $labels.team_id }} has received at least one HTTP 402
+            (budget cap exhausted) in the last 5 minutes. Every request
+            from this team is being rejected before any provider is ever
+            called, until the next budget period rolls over or an admin
+            raises the cap via PATCH /admin/budgets/{team_id}.

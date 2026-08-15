@@ -63,7 +63,7 @@ def test_load_tiers_config_parses_the_chain_key_per_tier(tmp_path):
 def test_resolve_chain_expands_a_configured_tier_name(client):
     router = client.app.state.fallback_router
     chain = router.resolve_chain("tier-1-reasoning")
-    assert chain == ["openai:gpt-5.4", "anthropic:claude-sonnet-5", "ollama:llama3.2"]
+    assert chain == ["openai:gpt-5.6-sol", "anthropic:claude-sonnet-5", "ollama:llama3.2"]
 
 
 def test_resolve_chain_treats_a_literal_model_id_as_its_own_one_link_chain(client):
@@ -89,8 +89,8 @@ async def test_primary_exhausts_retries_then_second_link_serves_the_response(app
     working = FakeAdapter(response_text="answer from the backup provider")
 
     def _resolve(model_id: str):
-        if model_id == "openai:gpt-5.4":
-            return failing, "gpt-5.4-served"
+        if model_id == "openai:gpt-5.6-sol":
+            return failing, "gpt-5.6-sol-served"
         if model_id == "anthropic:claude-sonnet-5":
             return working, "claude-sonnet-5-served"
         raise AssertionError(f"unexpected chain link resolved: {model_id}")
@@ -128,8 +128,8 @@ async def test_non_retryable_error_aborts_the_whole_chain_without_trying_the_nex
     working = FakeAdapter(response_text="should never be reached")
 
     def _resolve(model_id: str):
-        if model_id == "openai:gpt-5.4":
-            return bad_request, "gpt-5.4-served"
+        if model_id == "openai:gpt-5.6-sol":
+            return bad_request, "gpt-5.6-sol-served"
         raise AssertionError(f"a non-retryable failure must not advance the chain to {model_id}")
 
     monkeypatch.setattr("app.api.v1_chat.resolve_model", _resolve)
@@ -211,8 +211,8 @@ async def test_circuit_opens_after_threshold_and_the_network_call_is_skipped(app
     working = FakeAdapter(response_text="from the healthy fallback")
 
     def _resolve(model_id: str):
-        if model_id == "openai:gpt-5.4":
-            return failing, "gpt-5.4-served"
+        if model_id == "openai:gpt-5.6-sol":
+            return failing, "gpt-5.6-sol-served"
         if model_id == "anthropic:claude-sonnet-5":
             return working, "claude-sonnet-5-served"
         raise AssertionError(f"unexpected chain link resolved: {model_id}")
@@ -235,7 +235,7 @@ async def test_circuit_opens_after_threshold_and_the_network_call_is_skipped(app
         assert failing.call_count == 15  # 5 requests * 3 attempts each
         assert working.call_count == 5
 
-        status = await app.state.circuit_breaker.get_status(provider="fake", model="gpt-5.4-served")
+        status = await app.state.circuit_breaker.get_status(provider="fake", model="gpt-5.6-sol-served")
         assert status.state == "open"
 
         # The 6th request must skip straight past the now-open circuit —
@@ -286,8 +286,8 @@ async def test_streaming_falls_back_when_the_primary_fails_before_any_chunk(app,
     working = FakeAdapter(stream_chunks=["Hel", "lo"])
 
     def _resolve(model_id: str):
-        if model_id == "openai:gpt-5.4":
-            return failing, "gpt-5.4-served"
+        if model_id == "openai:gpt-5.6-sol":
+            return failing, "gpt-5.6-sol-served"
         if model_id == "anthropic:claude-sonnet-5":
             return working, "claude-sonnet-5-served"
         raise AssertionError(f"unexpected chain link resolved: {model_id}")
@@ -335,8 +335,8 @@ async def test_streaming_mid_stream_failure_does_not_fall_back(app, monkeypatch)
     never_reached = FakeAdapter(stream_chunks=["should", "not", "appear"])
 
     def _resolve(model_id: str):
-        if model_id == "openai:gpt-5.4":
-            return primary, "gpt-5.4-served"
+        if model_id == "openai:gpt-5.6-sol":
+            return primary, "gpt-5.6-sol-served"
         raise AssertionError(f"mid-stream failure must not advance the chain to {model_id}")
 
     monkeypatch.setattr("app.api.v1_chat.resolve_model", _resolve)

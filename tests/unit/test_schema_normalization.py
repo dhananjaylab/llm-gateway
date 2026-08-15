@@ -50,6 +50,17 @@ class TestOpenAITranslation:
         payload = self.adapter.translate_request(_unified_request(), provider_model="gpt-5.4")
         assert "stop" not in payload
 
+    def test_temperature_and_top_p_are_not_forwarded_gpt56_rejects_both(self):
+        """Phase 4 regression guard: the model-roster upgrade to GPT-5.6
+        Sol/Terra surfaced that temperature/top_p are rejected the same
+        way `stop` already was — see the version-note in
+        openai_adapter.py's translate_request."""
+        payload = self.adapter.translate_request(
+            _unified_request(temperature=0.4, top_p=0.9), provider_model="gpt-5.6-sol"
+        )
+        assert "temperature" not in payload
+        assert "top_p" not in payload
+
     def test_model_field_is_the_provider_model_not_the_unified_id(self):
         payload = self.adapter.translate_request(_unified_request(), provider_model="gpt-5.4")
         assert payload["model"] == "gpt-5.4"

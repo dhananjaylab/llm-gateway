@@ -28,9 +28,11 @@ def test_get_health_lists_every_provider_model_pair_reachable_from_tiers_yaml(cl
     data = resp.json()
 
     served = {(d["provider"], d["model"]) for d in data}
-    # config/tiers.yaml's three chains, deduplicated: openai:gpt-5.4,
-    # anthropic:claude-sonnet-5, anthropic:claude-haiku-4-5, ollama:llama3.2.
-    assert ("openai", "gpt-5.4") in served
+    # config/tiers.yaml's three chains, deduplicated (Phase 4 roster
+    # upgrade): openai:gpt-5.6-sol, anthropic:claude-sonnet-5,
+    # ollama:llama3.2, openai:gpt-5.6-terra, anthropic:claude-haiku-4-5.
+    assert ("openai", "gpt-5.6-sol") in served
+    assert ("openai", "gpt-5.6-terra") in served
     assert ("anthropic", "claude-sonnet-5") in served
     assert ("anthropic", "claude-haiku-4-5") in served
     assert ("ollama", "llama3.2") in served
@@ -45,13 +47,13 @@ def test_get_health_lists_every_provider_model_pair_reachable_from_tiers_yaml(cl
 def test_get_health_reflects_a_recorded_outcome(client, admin_headers):
     async def _record():
         await client.app.state.health_tracker.record_outcome(
-            provider="openai", model="gpt-5.4", ok=False, latency_ms=250.0
+            provider="openai", model="gpt-5.6-sol", ok=False, latency_ms=250.0
         )
 
     asyncio.run(_record())
 
     resp = client.get("/admin/health", headers=admin_headers)
-    entry = next(d for d in resp.json() if d["provider"] == "openai" and d["model"] == "gpt-5.4")
+    entry = next(d for d in resp.json() if d["provider"] == "openai" and d["model"] == "gpt-5.6-sol")
     assert entry["sample_count"] == 1
     assert entry["error_rate"] == 1.0
     assert entry["state"] in {"degraded", "down"}  # a single sample can't be "healthy" after a failure

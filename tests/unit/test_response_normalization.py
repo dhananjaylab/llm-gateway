@@ -19,37 +19,123 @@ def _request(model: str) -> UnifiedChatRequest:
     return UnifiedChatRequest(model=model, messages=[ChatMessage(role="user", content="hi")])
 
 
-def test_openai_response_normalizes_choices_message_content():
+def test_openai_response_normalizes_output_text_shorthand():
+    """output_text string shorthand is the fast path for single-output responses."""
     raw = {
-        "id": "chatcmpl-abc123",
-        "object": "chat.completion",
-        "created": 1730000000,
-        "model": "gpt-5.4-2026-03-05",
-        "choices": [
+        "id": "resp_abc123",
+        "object": "response",
+        "created_at": 1730000000,
+        "model": "gpt-5.6-sol",
+        "output_text": "Token buckets refill over time.",
+        "output": [
             {
-                "index": 0,
-                "message": {"role": "assistant", "content": "Token buckets refill over time."},
-                "finish_reason": "stop",
+                "type": "message",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "Token buckets refill over time."}],
             }
         ],
         "usage": {
-            "prompt_tokens": 12,
-            "completion_tokens": 8,
-            "total_tokens": 20,
-            "prompt_tokens_details": {"cached_tokens": 0},
+            "input_tokens": 12,
+            "output_tokens": 8,
+            "input_tokens_details": {"cached_tokens": 0},
         },
     }
     adapter = OpenAIAdapter(api_key="sk-test")
     unified = adapter.translate_response(
-        raw, request=_request("openai:gpt-5.4"), provider_model="gpt-5.4"
+        raw, request=_request("openai:gpt-5.6-sol"), provider_model="gpt-5.6-sol"
     )
 
     assert unified.provider == "openai"
-    assert unified.model_served == "gpt-5.4-2026-03-05"
+    assert unified.model_served == "gpt-5.6-sol"
     assert unified.choices[0].message.content == "Token buckets refill over time."
     assert unified.choices[0].finish_reason == "stop"
     assert unified.usage.input_tokens == 12
     assert unified.usage.output_tokens == 8
+    assert unified.created == 1730000000
+
+
+def test_openai_response_normalizes_typed_output_items():
+    """Typed output[].content[] path is used when output_text is absent."""
+    raw = {
+        "id": "resp_def456",
+        "object": "response",
+        "created_at": 1730000001,
+        "model": "gpt-5.6-sol",
+        "output": [
+            {
+                "type": "message",
+                "status": "completed",
+                "content": [
+                    {"type": "output_text", "text": "Part one. "},
+                    {"type": "output_text", "text": "Part two."},
+                ],
+            }
+        ],
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "input_tokens_details": {"cached_tokens": 0},
+        },
+    }
+    adapter = OpenAIAdapter(api_key="sk-test")
+    unified = adapter.translate_response(
+        raw, request=_request("openai:gpt-5.6-sol"), provider_model="gpt-5.6-sol"
+    )
+    assert unified.choices[0].message.content == "Part one. Part two."
+    assert unified.choices[0].finish_reason == "stop"
+
+
+def test_openai_response_maps_cached_tokens():
+    """input_tokens_details.cached_tokens maps to cache_read_input_tokens."""
+    raw = {
+        "id": "resp_cache",
+        "object": "response",
+        "created_at": 1730000002,
+        "model": "gpt-5.6-sol",
+        "output_text": "cached response",
+        "output": [
+            {
+                "type": "message",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "cached response"}],
+            }
+        ],
+        "usage": {
+            "input_tokens": 20,
+            "output_tokens": 4,
+            "input_tokens_details": {"cached_tokens": 15},
+        },
+    }
+    adapter = OpenAIAdapter(api_key="sk-test")
+    unified = adapter.translate_response(
+        raw, request=_request("openai:gpt-5.6-sol"), provider_model="gpt-5.6-sol"
+    )
+    assert unified.usage.cache_read_input_tokens == 15
+    assert unified.usage.input_tokens == 20
+
+
+def test_openai_response_uses_created_at_as_timestamp():
+    """created_at from the Responses API becomes the normalized created field."""
+    raw = {
+        "id": "resp_ts",
+        "object": "response",
+        "created_at": 1730099999,
+        "model": "gpt-5.6-sol",
+        "output_text": "hi",
+        "output": [
+            {
+                "type": "message",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "hi"}],
+            }
+        ],
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+    adapter = OpenAIAdapter(api_key="sk-test")
+    unified = adapter.translate_response(
+        raw, request=_request("openai:gpt-5.6-sol"), provider_model="gpt-5.6-sol"
+    )
+    assert unified.created == 1730099999
 
 
 def test_anthropic_response_normalizes_content_block_text():
@@ -139,13 +225,20 @@ def test_ollama_response_mints_an_id_since_ollama_has_none():
 def test_all_three_providers_produce_the_same_response_shape():
     openai_unified = OpenAIAdapter(api_key="k").translate_response(
         {
-            "id": "1",
-            "model": "gpt-5.4",
-            "choices": [{"message": {"content": "x"}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "id": "resp_1",
+            "model": "gpt-5.6-sol",
+            "output_text": "x",
+            "output": [
+                {
+                    "type": "message",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "x"}],
+                }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
         },
-        request=_request("openai:gpt-5.4"),
-        provider_model="gpt-5.4",
+        request=_request("openai:gpt-5.6-sol"),
+        provider_model="gpt-5.6-sol",
     )
     anthropic_unified = AnthropicAdapter(api_key="k").translate_response(
         {

@@ -207,7 +207,7 @@ async def test_probe_once_sends_a_minimal_single_token_ping(tracker: HealthTrack
     )
     sent = adapter.last_translated_request
     assert sent is not None
-    assert sent.max_tokens == 1
+    assert sent.max_tokens == 16
     assert sent.messages[0].content == "ping"
     assert sent.stream is False
 

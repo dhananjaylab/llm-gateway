@@ -1,35 +1,48 @@
 """
-OpenAI adapter (Chat Completions API).
+OpenAI adapter (Responses API).
 
-VERSION NOTE (verify at build time, per the TRD working agreement): OpenAI's
-current-generation chat models (the GPT-5.x family) require
-`max_completion_tokens` rather than the legacy `max_tokens` field, and
-support `stream_options: {"include_usage": true}` to get a final usage
-frame on a streamed response instead of having to locally re-tokenize.
-Both are applied below. GPT-5.x also rejects the `stop` parameter outright
-(400 "Unsupported parameter: 'stop' is not supported with this model") —
-confirmed for gpt-5.4, the model this gateway currently serves — so it is
-never forwarded (see the comment in translate_request). Re-verify field
-names against https://platform.openai.com/docs/api-reference/chat before
-pinning a model family in production, since this is the adapter most
-likely to drift.
+Upstream endpoint: POST {base_url}/v1/responses
+Auth:              Authorization: Bearer <OPENAI_API_KEY>
 
-UPDATE (Phase 4, model-roster upgrade to GPT-5.6 Sol/Terra): confirmed
-against current OpenAI/Azure OpenAI docs that GPT-5.6 and later models
-also don't support `temperature` or `top_p` on Chat Completions — the
-same "modern reasoning-family" constraint that already made `stop`
-unsendable, just wider. This mirrors the constraint
-anthropic_adapter.py already applies to Sonnet 5/Opus 4.7+ (see that
-file's translate_request). Both are now omitted unconditionally, same
-reasoning as `stop`: every OpenAI model currently configured in
-config/tiers.yaml / config/teams.yaml is GPT-5.x, so there's no
-still-supported model in this adapter's current scope that would need
-them forwarded. If an older model (e.g. gpt-4o) re-enters scope, this
-needs to become conditional on provider_model, same flag as `stop`'s.
+Request shape sent upstream
+────────────────────────────
+  model              provider model, e.g. "gpt-5.6-sol"
+  input              list of {"role": …, "content": …} items (user/assistant turns)
+  instructions       system prompt string, omitted when request.system is None
+  max_output_tokens  from gateway request.max_tokens
+  text.format        {"type": "text"} or {"type": "json_object"}, from request.response_format
+  store              always False — preserves the gateway's stateless behavior and avoids
+                     OpenAI persisting responses by default
+  stream             True/False from request.stream
 
-Endpoint: POST {base_url}/v1/chat/completions
-Auth: Authorization: Bearer <OPENAI_API_KEY>
-Streaming: SSE, "data: {json}\\n\\n" frames, terminated by "data: [DONE]".
+Response parsing
+────────────────
+  Non-streaming: prefer raw["output_text"] (string shorthand); otherwise concatenate
+  output[].content[] entries where type == "output_text".  Usage lives at
+  usage.{input_tokens,output_tokens,input_tokens_details.cached_tokens}.
+  Timestamp comes from created_at (int epoch seconds).
+
+Streaming SSE event model
+──────────────────────────
+  The Responses API uses named SSE events (event: <name>\\ndata: <json>\\n\\n).
+  Relevant events:
+    response.output_text.delta  → gateway stream delta (data["delta"])
+    response.completed          → terminal usage chunk (data["response"]["usage"])
+    error                       → raise ProviderError
+  Unknown events are silently skipped; the stream ends when the connection closes
+  (there is no [DONE] sentinel in the Responses SSE protocol).
+
+GPT-5.x model constraints (verified against OpenAI docs, Phase 4 roster)
+──────────────────────────────────────────────────────────────────────────
+  stop, temperature, and top_p are all rejected by GPT-5.x models with a 400
+  "Unsupported parameter" error — they are never forwarded. If an older model
+  (e.g. gpt-4o) re-enters scope, forwarding those fields would need to become
+  conditional on provider_model.
+
+HTTP status classification
+──────────────────────────
+  Retryable:     429, 502, 503, 504
+  Non-retryable: 400, 401, 403 (and any other 4xx/5xx)
 """
 
 from __future__ import annotations
@@ -52,7 +65,6 @@ from app.core.schema import (
 from app.providers.base import ProviderAdapter, ProviderError
 
 # HTTP statuses the TRD classifies as transient/retryable vs. permanent.
-# Phase 1 only uses this to label ProviderError; Phase 3 acts on it.
 _RETRYABLE_STATUS = {429, 502, 503, 504}
 
 
@@ -72,44 +84,40 @@ class OpenAIAdapter(ProviderAdapter):
     # -- request translation -------------------------------------------------
 
     def translate_request(self, request: UnifiedChatRequest, *, provider_model: str) -> dict:
-        messages: list[dict] = []
-        if request.system:
-            messages.append({"role": "system", "content": request.system})
-        messages.extend({"role": m.role, "content": m.content} for m in request.messages)
+        """Translate the unified gateway request to a Responses API payload.
+
+        NOTE: GPT-5.x models (every OpenAI model currently configured in
+        config/tiers.yaml / config/teams.yaml as of the Phase 4 roster
+        upgrade to gpt-5.6-sol/-terra) reject stop, temperature, and top_p
+        outright with a 400 "Unsupported parameter" error.  None of them are
+        forwarded here.  If an older model (e.g. gpt-4o) is added to this
+        adapter's scope later, forwarding those fields would need to become
+        conditional on provider_model.
+        """
+        input_items: list[dict] = [
+            {"role": m.role, "content": m.content} for m in request.messages
+        ]
 
         payload: dict = {
             "model": provider_model,
-            "messages": messages,
-            "max_completion_tokens": request.max_tokens,
+            "input": input_items,
+            "max_output_tokens": request.max_tokens,
+            "store": False,
             "stream": request.stream,
         }
-        # NOTE: GPT-5.x models (gpt-5.4 previously, gpt-5.6-sol/-terra as
-        # of the Phase 4 roster upgrade — every OpenAI model currently
-        # configured in config/tiers.yaml / config/teams.yaml) reject
-        # `stop`, `temperature`, and `top_p` outright with a 400
-        # "Unsupported parameter" error — confirmed against current
-        # OpenAI/Azure OpenAI docs for the GPT-5.x family, not a
-        # hypothetical. This is now the SAME class of constraint
-        # Anthropic's adapter already applies to Sonnet 5/Opus 4.7+ (see
-        # anthropic_adapter.py) — a provider-wide-for-this-model-family
-        # omission, not a per-request choice by the caller. Phase 1's
-        # adapter has no per-served-model conditional logic, and every
-        # OpenAI model currently in scope is GPT-5.x, so all three are
-        # deliberately never forwarded here. If an older model (e.g.
-        # gpt-4o) is added to this adapter's scope later, this needs to
-        # become conditional on provider_model rather than blanket-omitted.
+
+        if request.system:
+            payload["instructions"] = request.system
+
         if request.response_format is not None:
-            payload["response_format"] = {"type": request.response_format.type}
-        if request.stream:
-            # Ask for a terminal usage frame instead of locally re-tokenizing
-            # the assembled completion (see TRD streaming section).
-            payload["stream_options"] = {"include_usage": True}
+            payload["text"] = {"format": {"type": request.response_format.type}}
+
         return payload
 
     # -- non-streaming call ---------------------------------------------------
 
     async def call(self, payload: dict) -> dict:
-        url = f"{self._base_url}/v1/chat/completions"
+        url = f"{self._base_url}/v1/responses"
         headers = {"Authorization": f"Bearer {self._api_key}"}
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
@@ -132,28 +140,37 @@ class OpenAIAdapter(ProviderAdapter):
     def translate_response(
         self, raw: dict, *, request: UnifiedChatRequest, provider_model: str
     ) -> UnifiedChatResponse:
-        choice = raw["choices"][0]
+        """Normalize a Responses API response body to the unified gateway schema.
+
+        Text extraction precedence:
+          1. raw["output_text"] — the string shorthand OpenAI populates when the
+             response contains exactly one text output item.
+          2. Concatenation of output[].content[] entries where type == "output_text".
+        """
         usage_raw = raw.get("usage") or {}
+        input_tokens_details = usage_raw.get("input_tokens_details") or {}
         usage = Usage(
-            input_tokens=usage_raw.get("prompt_tokens", 0),
-            output_tokens=usage_raw.get("completion_tokens", 0),
-            cache_read_input_tokens=(usage_raw.get("prompt_tokens_details") or {}).get(
-                "cached_tokens", 0
-            ),
+            input_tokens=usage_raw.get("input_tokens", 0),
+            output_tokens=usage_raw.get("output_tokens", 0),
+            cache_read_input_tokens=input_tokens_details.get("cached_tokens", 0),
         )
+        message_content = _extract_responses_text(raw)
+        finish_reason = _extract_responses_finish_reason(raw)
+        model_served = raw.get("model", provider_model)
+        # Responses API returns created_at (int epoch seconds); fall back to
+        # local time if absent.
+        created = raw.get("created_at", int(time.time()))
         return UnifiedChatResponse(
             id=raw.get("id", UnifiedChatResponse.new_id()),
-            created=raw.get("created", int(time.time())),
+            created=created,
             provider=self.provider_name,
             model_requested=request.model,
-            model_served=raw.get("model", provider_model),
+            model_served=model_served,
             choices=[
                 UnifiedChoice(
                     index=0,
-                    message=ChatMessage(
-                        role="assistant", content=choice["message"]["content"] or ""
-                    ),
-                    finish_reason=_map_finish_reason(choice.get("finish_reason")),
+                    message=ChatMessage(role="assistant", content=message_content),
+                    finish_reason=finish_reason,
                 )
             ],
             usage=usage,
@@ -164,7 +181,18 @@ class OpenAIAdapter(ProviderAdapter):
     async def stream(
         self, payload: dict, *, request: UnifiedChatRequest, provider_model: str
     ) -> AsyncIterator[UnifiedStreamChunk]:
-        url = f"{self._base_url}/v1/chat/completions"
+        """Stream a Responses API SSE response, yielding normalized chunks.
+
+        The Responses API uses named SSE events:
+          event: response.output_text.delta   → content delta
+          event: response.completed           → terminal usage
+          event: error                        → ProviderError
+
+        Each SSE block is a sequence of "field: value" lines followed by a
+        blank line.  We accumulate the event name and data across lines and
+        dispatch when the block ends.
+        """
+        url = f"{self._base_url}/v1/responses"
         headers = {"Authorization": f"Bearer {self._api_key}"}
         chunk_id = f"gw-{uuid.uuid4().hex[:24]}"
 
@@ -175,43 +203,72 @@ class OpenAIAdapter(ProviderAdapter):
                         body = await resp.aread()
                         _raise_for_status_bytes(resp.status_code, body)
 
+                    event_name: str | None = None
+                    data_lines: list[str] = []
+
                     async for line in resp.aiter_lines():
-                        if not line or not line.startswith("data:"):
-                            continue
-                        data = line[len("data:") :].strip()
-                        if data == "[DONE]":
-                            break
+                        if line.startswith("event:"):
+                            event_name = line[len("event:"):].strip()
+                        elif line.startswith("data:"):
+                            data_lines.append(line[len("data:"):].strip())
+                        elif line == "":
+                            # Blank line: end of SSE block — dispatch if we have data.
+                            if event_name is not None and data_lines:
+                                raw_data = "".join(data_lines)
+                                try:
+                                    event_data = json.loads(raw_data)
+                                except json.JSONDecodeError:
+                                    event_name = None
+                                    data_lines = []
+                                    continue
 
-                        event = json.loads(data)
-                        served_model = event.get("model", provider_model)
+                                if event_name == "response.output_text.delta":
+                                    yield UnifiedStreamChunk(
+                                        id=chunk_id,
+                                        provider=self.provider_name,
+                                        model_served=provider_model,
+                                        delta=event_data.get("delta", ""),
+                                    )
 
-                        # The terminal usage-only frame (stream_options) has
-                        # an empty choices list.
-                        if not event.get("choices"):
-                            usage_raw = event.get("usage")
-                            if usage_raw:
-                                yield UnifiedStreamChunk(
-                                    id=chunk_id,
-                                    provider=self.provider_name,
-                                    model_served=served_model,
-                                    delta="",
-                                    usage=Usage(
-                                        input_tokens=usage_raw.get("prompt_tokens", 0),
-                                        output_tokens=usage_raw.get("completion_tokens", 0),
-                                    ),
-                                )
-                            continue
+                                elif event_name == "response.completed":
+                                    response_obj = event_data.get("response") or {}
+                                    usage_raw = response_obj.get("usage") or {}
+                                    input_tokens_details = (
+                                        usage_raw.get("input_tokens_details") or {}
+                                    )
+                                    served_model = response_obj.get("model", provider_model)
+                                    yield UnifiedStreamChunk(
+                                        id=chunk_id,
+                                        provider=self.provider_name,
+                                        model_served=served_model,
+                                        delta="",
+                                        finish_reason="stop",
+                                        usage=Usage(
+                                            input_tokens=usage_raw.get("input_tokens", 0),
+                                            output_tokens=usage_raw.get("output_tokens", 0),
+                                            cache_read_input_tokens=input_tokens_details.get(
+                                                "cached_tokens", 0
+                                            ),
+                                        ),
+                                    )
 
-                        choice = event["choices"][0]
-                        delta_text = (choice.get("delta") or {}).get("content") or ""
-                        finish_reason = _map_finish_reason(choice.get("finish_reason"))
-                        yield UnifiedStreamChunk(
-                            id=chunk_id,
-                            provider=self.provider_name,
-                            model_served=served_model,
-                            delta=delta_text,
-                            finish_reason=finish_reason,
-                        )
+                                elif event_name == "error":
+                                    message = event_data.get("message", str(event_data))
+                                    code = event_data.get("code")
+                                    status_code = int(code) if code and str(code).isdigit() else None
+                                    retryable = status_code in _RETRYABLE_STATUS if status_code else False
+                                    raise ProviderError(
+                                        f"openai stream error: {message}",
+                                        status_code=status_code,
+                                        retryable=retryable,
+                                        error_type="openai_error",
+                                    )
+
+                                # Unknown events (response.created, rate_limits, etc.) are skipped.
+
+                            event_name = None
+                            data_lines = []
+
         except httpx.TimeoutException as exc:
             raise ProviderError(
                 "openai stream timed out", retryable=True, error_type="timeout"
@@ -224,12 +281,34 @@ class OpenAIAdapter(ProviderAdapter):
             ) from exc
 
 
-def _map_finish_reason(reason: str | None) -> str | None:
-    return {
-        "stop": "stop",
-        "length": "length",
-        "content_filter": "content_filter",
-    }.get(reason or "", reason)
+def _extract_responses_text(raw: dict) -> str:
+    """Extract the assistant text from a Responses API response body.
+
+    Prefers the output_text shorthand string; falls back to concatenating
+    typed output[].content[] entries where type == "output_text".
+    """
+    if isinstance(raw.get("output_text"), str):
+        return raw["output_text"]
+
+    parts: list[str] = []
+    for item in raw.get("output") or []:
+        if item.get("type") != "message":
+            continue
+        for content in item.get("content") or []:
+            if content.get("type") == "output_text" and isinstance(content.get("text"), str):
+                parts.append(content["text"])
+    return "".join(parts)
+
+
+def _extract_responses_finish_reason(raw: dict) -> str | None:
+    """Map the Responses API output item status to a gateway finish reason."""
+    for item in raw.get("output") or []:
+        if item.get("type") == "message":
+            status = item.get("status")
+            if status == "completed":
+                return "stop"
+            return status
+    return None
 
 
 def _raise_for_status(resp: httpx.Response) -> None:

@@ -55,15 +55,24 @@ from redis import exceptions as redis_exceptions
 from redis.asyncio import Redis
 
 from app.core.redis_script import LuaScript
+from app.observability.metrics import GatewayMetrics, circuit_state_to_gauge_value
 
 logger = logging.getLogger("gateway.circuit_breaker")
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 
-# circuit_check.lua's state_code return values.
+# circuit_check.lua's state_code return values -- NOTE this is NOT the
+# same numbering as Document 05's Prometheus gauge (see
+# app/observability/metrics.py's module docstring: the gauge is
+# 0=closed/1=half_open/2=open, this is 0=closed/1=open/2=half_open). Every
+# conversion from this code to the exported gauge value goes through the
+# string form (_STATE_CODE_TO_STRING below, then
+# circuit_state_to_gauge_value()) specifically so the swap can't be
+# silently reintroduced by a future call site reusing this int directly.
 _STATE_CLOSED = 0
 _STATE_OPEN = 1
 _STATE_HALF_OPEN = 2
+_STATE_CODE_TO_STRING = {_STATE_CLOSED: "closed", _STATE_OPEN: "open", _STATE_HALF_OPEN: "half_open"}
 
 
 @dataclass
@@ -87,12 +96,14 @@ class CircuitBreaker:
         window_size: int = 10,
         cooldown_seconds: float = 60.0,
         clock=time.time,
+        metrics: GatewayMetrics | None = None,
     ) -> None:
         self._redis = redis
         self._failure_threshold = failure_threshold
         self._window_size = window_size
         self._cooldown = cooldown_seconds
         self._clock = clock
+        self._metrics = metrics
 
         check_text = (_SCRIPT_DIR / "circuit_check.lua").read_text(encoding="utf-8")
         self._check_script = LuaScript(redis, check_text, name="circuit_check")
@@ -107,6 +118,18 @@ class CircuitBreaker:
     @staticmethod
     def _window_key(provider: str, model: str) -> str:
         return f"circuit:{provider}:{model}:window"
+
+    def _update_gauge(self, provider: str, model: str, state: str) -> None:
+        """Sole call path onto `gen_ai_circuit_breaker_state` -- both
+        `allow_request` (which learns state from circuit_check.lua's int
+        code) and `_record` (which learns it from circuit_record.lua's
+        string) funnel through here so there is exactly one place doing
+        the Document-05 numbering conversion."""
+        if self._metrics is None:
+            return
+        self._metrics.circuit_breaker_state.labels(provider=provider, model=model).set(
+            circuit_state_to_gauge_value(state)
+        )
 
     # -- the interface app/resilience/stub.py established ---------------------
 
@@ -127,6 +150,7 @@ class CircuitBreaker:
 
         allowed = bool(int(allowed))
         state_code = int(state_code)
+        self._update_gauge(provider, model, _STATE_CODE_TO_STRING.get(state_code, "closed"))
 
         if allowed and state_code == _STATE_HALF_OPEN:
             # This call didn't just observe a Half-Open circuit — it IS
@@ -164,6 +188,12 @@ class CircuitBreaker:
                 exc_info=True,
             )
             return
+
+        # circuit_record.lua already returns the STRING state ("closed"/
+        # "open"/"half_open"), not a raw code -- straight into
+        # circuit_state_to_gauge_value() via _update_gauge, no int
+        # conversion needed on this path.
+        self._update_gauge(provider, model, new_state)
 
         if prev_state != new_state:
             logger.warning(

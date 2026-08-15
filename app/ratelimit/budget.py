@@ -40,6 +40,7 @@ from redis.asyncio import Redis
 
 from app.core.config import TeamConfig
 from app.core.redis_script import LuaScript
+from app.observability.metrics import GatewayMetrics
 
 logger = logging.getLogger("gateway.budget")
 
@@ -77,9 +78,12 @@ def period_key(team_id: str, budget_period: str, *, now: datetime | None = None)
 
 
 class BudgetEnforcer:
-    def __init__(self, redis: Redis, *, warn_fraction: float = 0.8) -> None:
+    def __init__(
+        self, redis: Redis, *, warn_fraction: float = 0.8, metrics: GatewayMetrics | None = None
+    ) -> None:
         self._redis = redis
         self._warn_fraction = warn_fraction
+        self._metrics = metrics
         script_text = (_SCRIPT_DIR / "budget_increment.lua").read_text(encoding="utf-8")
         self._script = LuaScript(redis, script_text, name="budget_increment")
 
@@ -132,6 +136,11 @@ class BudgetEnforcer:
 
         new_spend, cap, crossed_warning = raw
         crossed_warning = bool(int(crossed_warning))
+
+        if self._metrics is not None and float(cap):
+            self._metrics.budget_utilization_ratio.labels(team_id=team.team_id).set(
+                float(new_spend) / float(cap)
+            )
 
         if crossed_warning:
             logger.warning(

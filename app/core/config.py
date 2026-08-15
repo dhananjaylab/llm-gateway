@@ -232,6 +232,51 @@ class GatewaySettings(BaseModel):
     retry_base_delay_seconds: float = 0.2
     retry_max_delay_seconds: float = 4.0
 
+    # -- Phase 4: observability -----------------------------------------
+    # Resource identity for every span this process emits.
+    otel_service_name: str = "llm-gateway"
+    # OTLP/HTTP traces endpoint (e.g. http://localhost:4318/v1/traces). If
+    # unset, tracing.py still builds a real TracerProvider (so spans exist
+    # and can be asserted on in-process, e.g. by a test's own
+    # InMemorySpanExporter) but exports nothing — logged loudly once at
+    # boot, same "log loudly either way" posture as every other optional
+    # dependency in this codebase (Redis fail-open, budget fail-closed).
+    otel_exporter_otlp_endpoint: str | None = None
+    # Deliberately NOT "gen_ai_latest_experimental" by default — see
+    # app/observability/tracing.py's module docstring for the "search
+    # first" finding this pins against (nothing in the dedicated
+    # semantic-conventions-genai repo is Stable as of Phase 4 sign-off,
+    # and there's no versioned schema yet to opt into). Exposed as a
+    # setting anyway (not hardcoded) so a developer can flip it later
+    # without a code change once upstream stabilizes.
+    otel_semconv_stability_opt_in: str | None = None
+    # Compliance default per the TRD: prompt/completion text is NEVER a
+    # span attribute, and not even an opt-in span EVENT unless explicitly
+    # turned on here. See app/observability/tracing.py's
+    # `maybe_capture_content` — the event is deliberately NOT gen_ai.*
+    # namespaced (see that module's docstring) so this flag's blast radius
+    # is fully self-contained.
+    otel_capture_message_content: bool = False
+
+    # Prometheus /metrics endpoint. Scrape interval is a Prometheus-side
+    # concern (deploy/prometheus/prometheus.yml, Phase 5's container), not
+    # something the gateway process controls — kept here only as the one
+    # setting that IS the gateway's concern: whether /metrics exists at all.
+    metrics_enabled: bool = True
+
+    # Alerting (Phase 4 build task: "Route alerts to Slack... alert rule
+    # thresholds"). Alertmanager itself is Phase 5's container; these are
+    # the threshold VALUES the shipped deploy/prometheus/alerts.yml rules
+    # are written against, kept as settings (not hardcoded into the YAML)
+    # so re-tuning them doesn't require hand-editing PromQL — see
+    # deploy/prometheus/alerts.yml's own header for how these map in.
+    # health_down_error_rate (0.8, already defined above) doubles as the
+    # "provider error rate above threshold" alert's trigger value per
+    # explicit Phase 4 kickoff sign-off (keep Phase 3's assumed defaults
+    # as-is) — not re-declared here to avoid two names for one number.
+    alert_latency_p99_seconds: float = 5.0  # matches health_degraded_latency_p99_ms
+    slack_webhook_url: str | None = None
+
 
 @lru_cache(maxsize=1)
 def get_gateway_settings() -> GatewaySettings:
@@ -269,6 +314,13 @@ def get_gateway_settings() -> GatewaySettings:
         retry_max_attempts=int(os.environ.get("RETRY_MAX_ATTEMPTS", "3")),
         retry_base_delay_seconds=float(os.environ.get("RETRY_BASE_DELAY_SECONDS", "0.2")),
         retry_max_delay_seconds=float(os.environ.get("RETRY_MAX_DELAY_SECONDS", "4.0")),
+        otel_service_name=os.environ.get("OTEL_SERVICE_NAME", "llm-gateway"),
+        otel_exporter_otlp_endpoint=os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") or None,
+        otel_semconv_stability_opt_in=os.environ.get("OTEL_SEMCONV_STABILITY_OPT_IN") or None,
+        otel_capture_message_content=_env_bool("OTEL_CAPTURE_MESSAGE_CONTENT", False),
+        metrics_enabled=_env_bool("METRICS_ENABLED", True),
+        alert_latency_p99_seconds=float(os.environ.get("ALERT_LATENCY_P99_SECONDS", "5.0")),
+        slack_webhook_url=os.environ.get("SLACK_WEBHOOK_URL") or None,
     )
 
 

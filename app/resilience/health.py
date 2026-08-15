@@ -193,7 +193,7 @@ def _build_probe_request(provider_model: str) -> UnifiedChatRequest:
     return UnifiedChatRequest(
         model=provider_model,
         messages=[ChatMessage(role="user", content=_PROBE_PROMPT)],
-        max_tokens=1,
+        max_tokens=16,
         stream=False,
     )
 

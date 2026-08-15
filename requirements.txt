@@ -17,6 +17,21 @@
 #                  server. This is what makes `pytest` runnable with zero
 #                  external services, same as Phase 1.
 
+# NEW IN PHASE 4:
+#   opentelemetry-sdk / -exporter-otlp-proto-http / -instrumentation-fastapi
+#                - distributed tracing. Confirmed current versions via
+#                  `pip index versions` on Aug 11, 2026: sdk/exporter at
+#                  1.44.0, the FastAPI instrumentation package at 0.65b0
+#                  (OTel Python's instrumentation packages track their own
+#                  0.x beta line, not the SDK's 1.x line -- this is
+#                  normal, not a mismatch).
+#   prometheus-client
+#                - /metrics exposition. 0.26.0 current. Classic
+#                  (bucketed) Histograms are used, not native histograms
+#                  -- see app/observability/metrics.py's module docstring
+#                  for why (the library's native-histogram authoring
+#                  support is still narrow/opt-in as of this pass).
+
 fastapi[standard]>=0.136,<0.138
 uvicorn[standard]>=0.34,<0.35
 pydantic>=2.13,<3
@@ -24,6 +39,10 @@ httpx>=0.28,<0.29
 pyyaml>=6.0,<7
 python-dotenv>=1.0,<2
 redis>=8.1,<9
+opentelemetry-sdk>=1.44,<1.45
+opentelemetry-exporter-otlp-proto-http>=1.44,<1.45
+opentelemetry-instrumentation-fastapi>=0.65b0,<0.66
+prometheus-client>=0.26,<0.27
 pytest>=8.3,<9
 pytest-asyncio>=0.24,<0.25
 respx>=0.21,<0.22

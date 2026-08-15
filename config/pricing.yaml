@@ -23,6 +23,24 @@
 # under-billing a real cache-write-heavy workload. Add it once verified.
 
 models:
+  # GPT-5.6 family (GA July 9 2026, repriced July 30 2026) — added at
+  # Phase 4 kickoff alongside config/tiers.yaml's roster upgrade. Cache
+  # rates are 10% of input (90% discount) per OpenAI's published ratio,
+  # same convention as the gpt-5.4 row below. gpt-5.4's own row is left
+  # in place, unused by any tier chain now but still resolvable for any
+  # literal "openai:gpt-5.4" request (e.g. existing team grants,
+  # in-flight tests) — removing it would silently zero-cost those calls
+  # rather than erroring, which is worse than an unused row.
+  "openai:gpt-5.6-sol":
+    input_per_million: 5.00
+    output_per_million: 30.00
+    cache_read_per_million: 0.50
+
+  "openai:gpt-5.6-terra":
+    input_per_million: 2.00
+    output_per_million: 12.00
+    cache_read_per_million: 0.20
+
   "openai:gpt-5.4":
     input_per_million: 2.50
     output_per_million: 15.00

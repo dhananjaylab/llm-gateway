@@ -1,0 +1,16 @@
+# Grafana datasource provisioning (classic file-based provisioning, NOT
+# Git Sync -- see deploy/grafana/dashboards/*.json's shared header for
+# why Git Sync, GA as of Grafana 13.0, is the wrong tool for a local
+# docker-compose demo). Inert until Phase 5 mounts
+# deploy/grafana/provisioning/ into an actual Grafana container.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

@@ -8,6 +8,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from app.core import config as config_module
 from app.core.schema import (
@@ -109,6 +110,32 @@ def client(app: FastAPI) -> TestClient:
     # checker task) actually runs — a bare `TestClient(app)` does not
     # trigger startup/shutdown events.
     with TestClient(app) as c:
+        yield c
+
+
+@pytest.fixture
+def span_exporter() -> InMemorySpanExporter:
+    """
+    Phase 4 test seam: an in-process OTel span exporter, so tests can
+    assert on real emitted spans (names, kinds, attributes, status)
+    without a live OTLP collector. Paired with the `traced_app`/
+    `traced_client` fixtures below rather than the default `app`/`client`
+    ones, since most tests don't care about tracing at all and
+    `init_tracing()` still runs (cheaply) either way.
+    """
+    return InMemorySpanExporter()
+
+
+@pytest.fixture
+def traced_app(fake_redis: fakeredis.FakeAsyncRedis, span_exporter: InMemorySpanExporter) -> FastAPI:
+    from app.main import create_app
+
+    return create_app(redis_client=fake_redis, span_exporter_override=span_exporter)
+
+
+@pytest.fixture
+def traced_client(traced_app: FastAPI) -> TestClient:
+    with TestClient(traced_app) as c:
         yield c
 
 

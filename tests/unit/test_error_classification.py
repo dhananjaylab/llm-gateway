@@ -167,8 +167,8 @@ async def test_router_retries_then_falls_back_for_every_retryable_code(app, monk
     working = FakeAdapter(response_text="ok from fallback")
 
     def _resolve(model_id: str):
-        if model_id == "openai:gpt-5.4":
-            return failing, "gpt-5.4-served"
+        if model_id == "openai:gpt-5.6-sol":
+            return failing, "gpt-5.6-sol-served"
         if model_id == "anthropic:claude-sonnet-5":
             return working, "claude-sonnet-5-served"
         raise AssertionError(model_id)
@@ -194,8 +194,8 @@ async def test_router_aborts_immediately_for_every_non_retryable_code(app, monke
     working = FakeAdapter(response_text="must never be reached")
 
     def _resolve(model_id: str):
-        if model_id == "openai:gpt-5.4":
-            return failing, "gpt-5.4-served"
+        if model_id == "openai:gpt-5.6-sol":
+            return failing, "gpt-5.6-sol-served"
         raise AssertionError(f"non-retryable code {status_code} must not advance to {model_id}")
 
     monkeypatch.setattr("app.api.v1_chat.resolve_model", _resolve)

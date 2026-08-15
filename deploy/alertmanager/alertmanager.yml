@@ -1,0 +1,51 @@
+# Alertmanager Slack routing (TRD Phase 4 build task: "Route alerts to
+# Slack with actionable context"). Inert until Phase 5 mounts it into an
+# actual Alertmanager container alongside deploy/prometheus/alerts.yml --
+# see that file's header for the docker-compose scoping decision.
+#
+# `slack_api_url_file` (not `slack_api_url`) reads the webhook from a
+# mounted file rather than embedding it in this checked-in YAML --
+# GatewaySettings.slack_webhook_url (SLACK_WEBHOOK_URL env var) is where
+# the gateway process itself would read the same value from if it ever
+# needs to post directly; Alertmanager's own config intentionally doesn't
+# support raw env-var interpolation, so Phase 5's compose wiring is
+# expected to write $SLACK_WEBHOOK_URL out to the file this path points
+# at (e.g. via an init container or entrypoint script) rather than baking
+# a secret into version control. Leaving the mounted file empty/absent is
+# a safe no-op -- Alertmanager queues the notification and retries, it
+# doesn't crash the container, matching this codebase's "log loudly,
+# don't take the whole system down" posture for every other optional
+# integration (Redis fail-open, health-check probing, etc).
+
+global:
+  slack_api_url_file: /etc/alertmanager/secrets/slack_webhook_url
+
+route:
+  receiver: slack-default
+  group_by: ["alertname", "provider", "team_id"]
+  group_wait: 10s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # Anything severity=critical (CircuitBreakerOpen, TeamBudgetExhausted)
+    # repeats sooner than the 4h default -- an open circuit or a blocked
+    # team is worth re-nagging about if it's still true 30 minutes later.
+    - matchers:
+        - severity="critical"
+      receiver: slack-critical
+      repeat_interval: 30m
+
+receivers:
+  - name: slack-default
+    slack_configs:
+      - channel: "#llm-gateway-alerts"
+        send_resolved: true
+        title: "{{ .CommonAnnotations.summary }}"
+        text: "{{ .CommonAnnotations.description }}"
+
+  - name: slack-critical
+    slack_configs:
+      - channel: "#llm-gateway-alerts-critical"
+        send_resolved: true
+        title: ":rotating_light: {{ .CommonAnnotations.summary }}"
+        text: "{{ .CommonAnnotations.description }}"

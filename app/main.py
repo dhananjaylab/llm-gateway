@@ -36,7 +36,8 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from redis.asyncio import Redis
 
 from app.api.admin import router as admin_router
@@ -46,6 +47,8 @@ from app.core.config import get_gateway_settings, load_teams_config, load_tiers_
 from app.core.pricing import load_pricing
 from app.core.redis_client import build_redis_client
 from app.core.team_store import TeamConfigStore
+from app.observability.metrics import build_metrics
+from app.observability.tracing import init_tracing
 from app.providers.registry import all_configured_provider_models, resolve_model
 from app.ratelimit.budget import BudgetEnforcer
 from app.ratelimit.limiter import RateLimiter
@@ -93,12 +96,24 @@ def _build_lifespan(redis_client_override: Redis | None):
 
         app.state.redis = redis_client
         app.state.team_store = TeamConfigStore(redis_client)
+
+        # -- Phase 4: metrics --------------------------------------------------
+        # Built early -- BudgetEnforcer, CircuitBreaker, and FallbackRouter
+        # below all take it as a constructor arg. Tracing is NOT set up
+        # here -- see create_app()'s comment for why FastAPIInstrumentor has
+        # to run before the lifespan's first ASGI call, not inside it.
+        # app.state.tracer/.tracer_provider are already populated by the
+        # time this function runs.
+        app.state.metrics = build_metrics() if settings.metrics_enabled else None
+
         app.state.rate_limiter = RateLimiter(
             redis_client,
             key_ttl_seconds=settings.rate_limit_key_ttl_seconds,
             fail_open=settings.rate_limit_fail_open,
         )
-        app.state.budget_enforcer = BudgetEnforcer(redis_client, warn_fraction=settings.budget_warn_fraction)
+        app.state.budget_enforcer = BudgetEnforcer(
+            redis_client, warn_fraction=settings.budget_warn_fraction, metrics=app.state.metrics
+        )
         app.state.batch_queue = BatchPriorityQueue(
             redis_client,
             max_wait_seconds=settings.batch_queue_max_wait_seconds,
@@ -116,6 +131,7 @@ def _build_lifespan(redis_client_override: Redis | None):
             failure_threshold=settings.circuit_breaker_failure_threshold,
             window_size=settings.circuit_breaker_window_size,
             cooldown_seconds=settings.circuit_breaker_cooldown_seconds,
+            metrics=app.state.metrics,
         )
         app.state.health_tracker = HealthTracker(
             redis_client,
@@ -134,6 +150,9 @@ def _build_lifespan(redis_client_override: Redis | None):
             retry_policy=retry_policy,
             tiers_config=app.state.tiers_config,
             health_tracker=app.state.health_tracker,
+            tracer=app.state.tracer,
+            metrics=app.state.metrics,
+            capture_content=settings.otel_capture_message_content,
         )
 
         seeded = await app.state.team_store.seed_from_yaml_if_empty(load_teams_config())
@@ -171,24 +190,51 @@ def _build_lifespan(redis_client_override: Redis | None):
                 health_checker_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await health_checker_task
+            # Flush any batched-but-not-yet-exported spans before the
+            # process/test tears down. A no-op when nothing was ever
+            # added as a processor (otlp_endpoint unset AND no test
+            # override) -- shutdown() on an empty provider is safe.
+            app.state.tracer_provider.shutdown()
             if owns_redis:
                 await redis_client.aclose()
 
     return lifespan
 
 
-def create_app(*, redis_client: Redis | None = None) -> FastAPI:
+def create_app(*, redis_client: Redis | None = None, span_exporter_override=None) -> FastAPI:
+    settings = get_gateway_settings()
+
     app = FastAPI(
         title="LLM Gateway",
-        version="0.3.0",
+        version="0.4.0",
         description=(
             "Multi-provider LLM API gateway: unified schema, rate limiting, "
-            "fallback routing, and observability. Phase 3: tier-based fallback "
-            "chains, retry with backoff, Redis-backed circuit breakers, and "
-            "active/passive health checking."
+            "fallback routing, and observability. Phase 4: OpenTelemetry "
+            "distributed tracing, Prometheus metrics, and alert rules on top "
+            "of Phase 3's tier-based fallback chains and circuit breakers."
         ),
         lifespan=_build_lifespan(redis_client),
     )
+
+    # Tracing is wired HERE, before the app is ever invoked via ASGI --
+    # including before its own lifespan "startup" scope, which is itself
+    # the first ASGI call. Starlette lazily builds and *caches*
+    # `app.middleware_stack` on that first call; FastAPIInstrumentor works
+    # by adding a middleware, so instrumenting from inside the lifespan
+    # (as an earlier draft of this did) is one call too late -- the
+    # middleware stack would already be built and cached without it,
+    # and the root SERVER span would silently never be created. Confirmed
+    # by hand against a running app before landing this: moving
+    # `init_tracing()` here (from inside `_build_lifespan`) is what fixed
+    # zero spans being exported for real HTTP requests.
+    app.state.tracer_provider = init_tracing(
+        app,
+        service_name=settings.otel_service_name,
+        service_version=app.version,
+        otlp_endpoint=settings.otel_exporter_otlp_endpoint,
+        span_exporter_override=span_exporter_override,
+    )
+    app.state.tracer = app.state.tracer_provider.get_tracer(settings.otel_service_name)
 
     app.include_router(v1_chat_router)
     app.include_router(admin_router)
@@ -208,7 +254,17 @@ def create_app(*, redis_client: Redis | None = None) -> FastAPI:
             )
         return {"status": "ready"}
 
-    return app
+    @app.get("/metrics")
+    async def metrics():
+        """Prometheus scrape target (TRD: "exposed on GET /metrics for
+        scraping every 5-15 seconds"). 404s rather than 200-with-empty-body
+        when METRICS_ENABLED=false, so a misconfigured scrape target fails
+        loudly in Prometheus rather than silently recording zero series."""
+        if app.state.metrics is None:
+            return JSONResponse(status_code=404, content={"detail": "metrics are disabled"})
+        payload = generate_latest(app.state.metrics.registry)
+        return Response(content=payload, media_type=CONTENT_TYPE_LATEST)
 
+    return app
 
 app = create_app()

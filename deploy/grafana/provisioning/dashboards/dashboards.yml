@@ -1,0 +1,27 @@
+# Grafana dashboard provider config -- classic file-based provisioning.
+#
+# PHASE 4 "SEARCH FIRST" FINDING: Grafana's Git Sync feature reached GA in
+# 13.0 (current stable as of Phase 4 sign-off, not the TRD's assumed
+# 12.x), and it IS the modern "dashboards as code" story Grafana now
+# recommends -- but it's built for a live Grafana instance syncing
+# against a GitHub/GitLab repo over the network, with its own app
+# permissions and provisioning flow. That's the wrong tool for a
+# `docker-compose up` local/demo/CI environment with no external Git
+# host in the loop. Classic file provisioning (this file, pointing at a
+# folder Phase 5's docker-compose bind-mounts from
+# deploy/grafana/dashboards/) remains the right mechanism here -- it's
+# also still fully supported in Grafana 13.x, not deprecated.
+
+apiVersion: 1
+
+providers:
+  - name: llm-gateway
+    orgId: 1
+    folder: "LLM Gateway"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

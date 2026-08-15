@@ -14,6 +14,19 @@ names against https://platform.openai.com/docs/api-reference/chat before
 pinning a model family in production, since this is the adapter most
 likely to drift.
 
+UPDATE (Phase 4, model-roster upgrade to GPT-5.6 Sol/Terra): confirmed
+against current OpenAI/Azure OpenAI docs that GPT-5.6 and later models
+also don't support `temperature` or `top_p` on Chat Completions — the
+same "modern reasoning-family" constraint that already made `stop`
+unsendable, just wider. This mirrors the constraint
+anthropic_adapter.py already applies to Sonnet 5/Opus 4.7+ (see that
+file's translate_request). Both are now omitted unconditionally, same
+reasoning as `stop`: every OpenAI model currently configured in
+config/tiers.yaml / config/teams.yaml is GPT-5.x, so there's no
+still-supported model in this adapter's current scope that would need
+them forwarded. If an older model (e.g. gpt-4o) re-enters scope, this
+needs to become conditional on provider_model, same flag as `stop`'s.
+
 Endpoint: POST {base_url}/v1/chat/completions
 Auth: Authorization: Bearer <OPENAI_API_KEY>
 Streaming: SSE, "data: {json}\\n\\n" frames, terminated by "data: [DONE]".
@@ -70,23 +83,21 @@ class OpenAIAdapter(ProviderAdapter):
             "max_completion_tokens": request.max_tokens,
             "stream": request.stream,
         }
-        if request.temperature is not None:
-            payload["temperature"] = request.temperature
-        if request.top_p is not None:
-            payload["top_p"] = request.top_p
-        # NOTE: GPT-5.x models (gpt-5.4, the model this gateway currently
-        # serves per config/teams.yaml, included) reject the `stop`
-        # parameter outright with "400 Unsupported parameter: 'stop' is not
-        # supported with this model" — confirmed against multiple current
-        # reports for this exact model family, not a hypothetical. Unlike
-        # Anthropic's temperature/top_p removal (see anthropic_adapter.py),
-        # this constraint is model-specific rather than provider-wide: an
-        # older model (e.g. gpt-4o) still accepts `stop`. Phase 1's adapter
-        # has no per-served-model conditional logic, and every OpenAI model
-        # currently configured in teams.yaml is GPT-5.x, so `stop` is
-        # deliberately never forwarded here. If an older model is added to
-        # this adapter's scope later, this needs to become conditional on
-        # provider_model rather than blanket-omitted.
+        # NOTE: GPT-5.x models (gpt-5.4 previously, gpt-5.6-sol/-terra as
+        # of the Phase 4 roster upgrade — every OpenAI model currently
+        # configured in config/tiers.yaml / config/teams.yaml) reject
+        # `stop`, `temperature`, and `top_p` outright with a 400
+        # "Unsupported parameter" error — confirmed against current
+        # OpenAI/Azure OpenAI docs for the GPT-5.x family, not a
+        # hypothetical. This is now the SAME class of constraint
+        # Anthropic's adapter already applies to Sonnet 5/Opus 4.7+ (see
+        # anthropic_adapter.py) — a provider-wide-for-this-model-family
+        # omission, not a per-request choice by the caller. Phase 1's
+        # adapter has no per-served-model conditional logic, and every
+        # OpenAI model currently in scope is GPT-5.x, so all three are
+        # deliberately never forwarded here. If an older model (e.g.
+        # gpt-4o) is added to this adapter's scope later, this needs to
+        # become conditional on provider_model rather than blanket-omitted.
         if request.response_format is not None:
             payload["response_format"] = {"type": request.response_format.type}
         if request.stream:

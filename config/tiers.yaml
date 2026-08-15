@@ -15,15 +15,24 @@
 # one-link "chain", so a literal request never gets surprise fallback
 # behavior it didn't ask for.
 #
-# VERSION NOTE / SCOPE NOTE (Phase 3 delivery): chains below deliberately
-# reuse the exact model identifiers already pinned in config/pricing.yaml
-# and config/teams.yaml (gpt-5.4, claude-sonnet-5, claude-haiku-4-5,
-# llama3.2) rather than adopting newer releases (e.g. OpenAI's GPT-5.6
-# "Sol/Terra/Luna" family, GA July 2026) — upgrading the served model
-# roster is a product decision independent of this phase's mandate
-# (resilience, not model selection) and would also need new
-# config/pricing.yaml rows. Flagged here as a suggested follow-up, not
-# decided silently.
+# VERSION NOTE (Phase 4 kickoff, developer sign-off): chains below were
+# upgraded from gpt-5.4 to the GPT-5.6 "Sol/Terra/Luna" family (GA July 9
+# 2026, repriced July 30 2026) per explicit developer sign-off ahead of
+# Phase 4 — this was flagged as an open decision at Phase 3 handoff and
+# resolved here rather than silently carried forward. Sol replaces gpt-5.4
+# as the tier-1-reasoning primary; Terra is newly added as the tier-2-fast
+# primary (tier-2 previously had no OpenAI link at all). See
+# config/pricing.yaml for the matching cost rows and
+# app/providers/openai_adapter.py for an adapter-level fix this upgrade
+# surfaced (temperature/top_p are no longer sent to any OpenAI model,
+# not just `stop` — GPT-5.6 rejects both, same constraint Anthropic's
+# adapter already applies to Sonnet 5/Opus 4.7+).
+#
+# Model-id note: "gpt-5.6-sol" / "gpt-5.6-terra" are the tier-qualified
+# ids (as opposed to the bare "gpt-5.6" alias, which silently defaults to
+# Sol) — re-verify these exact strings against
+# platform.openai.com/docs/api-reference/chat before this ever bills a
+# real account, same as every other model id in this file.
 #
 # Gemini is deliberately NOT in any chain here: GeminiAdapter.stream()
 # always raises a non-retryable ProviderError (Gemini streaming isn't
@@ -37,10 +46,10 @@
 
 tiers:
   tier-1-reasoning:
-    chain: ["openai:gpt-5.4", "anthropic:claude-sonnet-5", "ollama:llama3.2"]
+    chain: ["openai:gpt-5.6-sol", "anthropic:claude-sonnet-5", "ollama:llama3.2"]
 
   tier-2-fast:
-    chain: ["anthropic:claude-haiku-4-5", "ollama:llama3.2"]
+    chain: ["openai:gpt-5.6-terra", "anthropic:claude-haiku-4-5", "ollama:llama3.2"]
 
   tier-3-local:
     chain: ["ollama:llama3.2"]

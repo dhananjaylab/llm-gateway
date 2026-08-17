@@ -1,0 +1,13 @@
+# Standalone service -- deliberately NOT the gateway's own requirements.txt.
+# This container never has app/ (the gateway package) on its Python path
+# and needs none of Redis/OpenTelemetry/prometheus-client; keeping this
+# list minimal keeps the image small and keeps it obvious that this is a
+# genuinely separate service, not a repackaging of the gateway.
+#
+# Versions confirmed current via `pip index versions` alongside the
+# gateway's own requirements.txt (Aug 2026 pass) -- kept loosely pinned
+# to the same floor as the gateway's fastapi[standard]/uvicorn[standard]
+# so both images build from a consistent, already-verified baseline.
+fastapi[standard]>=0.136,<0.138
+uvicorn[standard]>=0.34,<0.35
+pydantic>=2.13,<3

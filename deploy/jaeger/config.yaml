@@ -1,0 +1,59 @@
+# Jaeger v2 all-in-one config, in-memory storage -- developer sign-off at
+# Phase 5 kickoff chose Jaeger over Tempo for trace storage/UI.
+#
+# VERSION NOTE ("search first" pass, Aug 2026): Jaeger v1 (the old
+# `jaegertracing/all-in-one` image, configured via COLLECTOR_OTLP_ENABLED
+# and friends) reached end of life on 2025-12-31. Jaeger v2 -- current
+# stable as of this pass -- is architected as a distribution of the
+# OpenTelemetry Collector with Jaeger's storage/query layered on top, so
+# it speaks OTLP natively on 4317 (gRPC) and 4318 (HTTP) and is
+# configured ONLY via a YAML file like this one, not environment
+# variables the way v1 was. Image: jaegertracing/jaeger:2.20.0 (see
+# docker-compose.yml). Re-verify both facts (EOL date holding, and
+# whether a newer 2.x has shipped) before this ever anchors a real
+# deployment -- this stack moves monthly, same as everything else in the
+# project.
+#
+# In-memory storage (`memstore`) means traces do not survive a container
+# restart -- correct for this project's stated scope (local/demo/CI, per
+# the TRD's Hosting table; Kubernetes + a real backing store is the
+# documented v2 extension, not a Phase 5 deliverable). max_traces caps
+# memory use, not wall-clock retention -- oldest traces are evicted once
+# the cap is hit.
+#
+# gateway's own OTEL_EXPORTER_OTLP_ENDPOINT (docker-compose.yml) points
+# at http://jaeger:4318/v1/traces, matching the http receiver below and
+# the opentelemetry-exporter-otlp-proto-http package already pinned in
+# requirements.txt (Phase 4) -- no gateway code changes needed, only the
+# env var that was blank through Phase 4 now has a real target.
+
+service:
+  extensions: [jaeger_storage, jaeger_query]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [jaeger_storage_exporter]
+
+extensions:
+  jaeger_query:
+    storage:
+      traces: memstore
+    # Serves the web UI on :16686 (docker-compose.yml's published port)
+    # and the query HTTP API Grafana's Jaeger datasource reads from.
+  jaeger_storage:
+    backends:
+      memstore:
+        memory:
+          max_traces: 100000
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  jaeger_storage_exporter:
+    trace_storage: memstore

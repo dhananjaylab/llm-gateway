@@ -121,3 +121,51 @@ def test_get_budget_reflects_recorded_spend(client, monkeypatch, admin_headers):
     data = resp.json()
     assert data["spend_usd"] == 9.0
     assert data["budget_cap_usd"] == 100.0
+
+
+def test_patching_the_cap_after_spend_already_recorded_this_period_takes_effect_immediately(
+    client, monkeypatch, admin_headers
+):
+    """
+    Regression guard for a real Phase 2 bug caught during Phase 5
+    integration testing: budget_increment.lua used to seed `cap_usd`
+    into the per-period Redis hash only on its FIRST write and reuse
+    that stale value on every later call in the same period -- so an
+    admin's PATCH to a team's budget cap had zero enforcement effect for
+    the rest of an already-active period, silently contradicting the
+    PRD's "a policy change never requires a deploy or a restart" user
+    story and Document 03 Journey D. Every other Phase 2 budget test
+    PATCHes the cap BEFORE any spend exists that period, which is
+    exactly why this slipped through: it never exercised "PATCH after
+    spend already happened this period." A real, long-lived container
+    (Phase 5's docker-compose stack, not a fresh fakeredis per test) hit
+    it on the very first repeated test run.
+    """
+    client.patch("/admin/budgets/data-science", json={"budget_cap_usd": 100.0}, headers=admin_headers)
+    fake = _set_fixed_cost_per_call(client, cost_usd=3.0)
+
+    first = _post(client, monkeypatch, fake)  # spend 0 -> 3, seeds the period's ledger
+    assert first.status_code == 200
+
+    # Lower the cap now, AFTER spend already exists this period -- this
+    # is the exact call sequence the old code silently ignored.
+    lowered = client.patch(
+        "/admin/budgets/data-science", json={"budget_cap_usd": 2.0}, headers=admin_headers
+    )
+    assert lowered.status_code == 200
+    assert lowered.json()["budget_cap_usd"] == 2.0
+
+    second = _post(client, monkeypatch, fake)  # spend(3.0) already >= the NEW cap(2.0)
+    assert second.status_code == 402, (
+        "the lowered cap must be enforced on the very next request -- "
+        f"got {second.status_code}, meaning the stale per-period cap won again"
+    )
+    body = second.json()["detail"]["error"]
+    assert body["cap_usd"] == 2.0
+
+    # And raising it back up must take effect just as immediately.
+    raised = client.patch("/admin/budgets/data-science", json={"budget_cap_usd": 100.0}, headers=admin_headers)
+    assert raised.status_code == 200
+
+    third = _post(client, monkeypatch, fake)
+    assert third.status_code == 200, "raising the cap back up must also take effect on the next request"

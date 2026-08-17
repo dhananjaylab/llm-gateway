@@ -1,9 +1,23 @@
-# Phase 2 scope: just Redis, so `docker-compose up -d` gets a developer to
-# a working REDIS_URL without installing Redis locally. The full stack
-# (gateway container, Prometheus, Grafana, mock/chaos provider endpoints,
-# demo-team seeding as an init container) is Document 06 Phase 5's
-# deliverable — deliberately not built here to avoid scope creep into a
-# later phase's done criteria.
+# Phase 5: the full stack. Phases 1-4's docker-compose.yml stayed
+# Redis-only by explicit sign-off at Phase 4 kickoff -- this is the
+# "Containerize the full stack" deliverable that was deferred to.
+#
+# `docker-compose up` (no profile) brings up everything a reviewer needs
+# with ZERO manual configuration and ZERO real API keys: the gateway's
+# provider adapters point at `mock-providers` (see the `gateway` service's
+# environment below), which is a real, wire-compatible test double for
+# OpenAI/Anthropic/Ollama/Gemini with a live chaos-injection control
+# plane. `demo-seed` prints a credentials banner once the whole stack is
+# actually healthy -- see scripts/setup_demo_teams.py.
+#
+# `docker compose --profile load-test run --rm k6` runs the 5,000+
+# concurrent-request benchmark (loadtest/k6_gateway_stress.js) against
+# the same stack -- kept out of the default `up` so a reviewer doesn't
+# get hit with a multi-minute load test just from starting the demo.
+#
+# Tracing backend: Jaeger (developer sign-off over Grafana Tempo at
+# Phase 5 kickoff). See deploy/jaeger/config.yaml for the version note on
+# why Jaeger v2's all-in-one needs an explicit config file.
 
 services:
   redis:
@@ -15,3 +29,200 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+  mock-providers:
+    build:
+      context: ./deploy/mock-providers
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: llm-gateway:phase5
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      GATEWAY_ADMIN_KEY: ${GATEWAY_ADMIN_KEY:-dev-admin-key-change-me}
+      # Zero-cost demo defaults: every provider adapter points at
+      # mock-providers, not a real vendor. Override these three in a
+      # local .env (not committed) to demo against real providers
+      # instead -- the adapters themselves don't change either way.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-mock-key}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-http://mock-providers:9000/openai}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-mock-key}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-http://mock-providers:9000/anthropic}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://mock-providers:9000/ollama}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-mock-key}
+      GEMINI_BASE_URL: ${GEMINI_BASE_URL:-http://mock-providers:9000/gemini/v1beta}
+      # Active health probing against mock-providers is real and cheap
+      # (no API credits, it's on localhost) -- unlike the unit test
+      # suite (tests/unit/conftest.py forces this off against fake
+      # credentials), leaving it on here actually demonstrates Phase 3's
+      # health-check surface for real.
+      HEALTH_CHECK_ENABLED: "true"
+      HEALTH_CHECK_INTERVAL_SECONDS: "30"
+      METRICS_ENABLED: "true"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock-providers:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+  demo-seed:
+    image: llm-gateway:phase5
+    depends_on:
+      redis:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      GATEWAY_ADMIN_KEY: ${GATEWAY_ADMIN_KEY:-dev-admin-key-change-me}
+      DEMO_GATEWAY_URL: http://localhost:8000
+    entrypoint: ["python", "scripts/setup_demo_teams.py"]
+    restart: "no"
+
+  prometheus:
+    image: prom/prometheus:v3.13.2
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--web.enable-lifecycle"
+      # Required for the k6 load-test profile's
+      # `--out experimental-prometheus-rw` output -- otherwise absent in
+      # a default Prometheus 3.x install, matching Grafana's own k6
+      # remote-write documentation.
+      - "--enable-feature=remote-write-receiver"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  alertmanager-secrets-init:
+    # One-shot: writes $SLACK_WEBHOOK_URL (blank is fine -- Alertmanager
+    # queues/retries a blank webhook silently, per alertmanager.yml's own
+    # header note) into a named volume shared with the `alertmanager`
+    # service below, so the real secret never has to live in this
+    # checked-in compose file or in alertmanager.yml itself. This is the
+    # "auto" option from Phase 5 sign-off, over a manual pre-flight step.
+    image: alpine:3.20
+    environment:
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+    volumes:
+      - alertmanager-secrets:/secrets
+    entrypoint:
+      - sh
+      - -c
+      - |
+        mkdir -p /secrets
+        printf '%s' "${SLACK_WEBHOOK_URL}" > /secrets/slack_webhook_url
+        if [ -z "${SLACK_WEBHOOK_URL}" ]; then
+          echo "SLACK_WEBHOOK_URL not set -- Alertmanager will run with an empty webhook (alerts fire, just unrouted). Set it in .env to wire real Slack routing."
+        else
+          echo "wrote Alertmanager Slack webhook secret"
+        fi
+
+  alertmanager:
+    image: prom/alertmanager:v0.32.0
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+    volumes:
+      - ./deploy/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-secrets:/etc/alertmanager/secrets:ro
+    ports:
+      - "9093:9093"
+    depends_on:
+      alertmanager-secrets-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9093/-/healthy"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  jaeger:
+    image: jaegertracing/jaeger:2.20.0
+    command: ["--config", "/etc/jaeger/config.yaml"]
+    volumes:
+      - ./deploy/jaeger/config.yaml:/etc/jaeger/config.yaml:ro
+    ports:
+      - "16686:16686" # UI + query API (Grafana's datasource reads this)
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP (what the gateway actually uses)
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:16686 > /dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 8
+      start_period: 10s
+
+  grafana:
+    image: grafana/grafana:13.1.3
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      jaeger:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health > /dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 8
+      start_period: 10s
+
+  # -- load-test profile: `docker compose --profile load-test run --rm k6` ---
+  k6:
+    image: grafana/k6:1.3.0
+    profiles: ["load-test"]
+    volumes:
+      - ./loadtest:/scripts:ro
+    environment:
+      GATEWAY_BASE_URL: http://gateway:8000
+      MOCK_PROVIDERS_BASE_URL: http://mock-providers:9000
+      TEAM_API_KEY: sk-gw-datascience-demo-001
+      K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
+      K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM: "true"
+    command: ["run", "--out", "experimental-prometheus-rw", "/scripts/k6_gateway_stress.js"]
+    depends_on:
+      gateway:
+        condition: service_healthy
+      prometheus:
+        condition: service_healthy
+
+volumes:
+  alertmanager-secrets:

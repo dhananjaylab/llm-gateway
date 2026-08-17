@@ -88,16 +88,29 @@ class BudgetEnforcer:
         self._script = LuaScript(redis, script_text, name="budget_increment")
 
     async def precheck(self, team: TeamConfig) -> BudgetDecision:
+        """
+        BUGFIX (Phase 5): previously read `cap_usd` back from the
+        per-period Redis hash and preferred it over `team.budget_cap_usd`
+        whenever it was present -- but that stored value is whatever was
+        active the first time `record_spend()` ran this period (see
+        budget_increment.lua's own bugfix note), so an admin's PATCH to
+        the live cap had no enforcement effect for the rest of an
+        already-active period. `team.budget_cap_usd` (resolved fresh by
+        the caller from TeamConfigStore on every request, same hot-reload
+        path every other admin-changeable setting in this codebase uses)
+        is now always the enforcement cap; only `spend_usd` is read from
+        the ledger.
+        """
         key, _ = period_key(team.team_id, team.budget_period)
         try:
-            raw = await self._redis.hmget(key, "spend_usd", "cap_usd")
+            raw = await self._redis.hmget(key, "spend_usd")
         except (redis_exceptions.ConnectionError, redis_exceptions.TimeoutError) as exc:
             raise BudgetUnavailableError(
                 f"redis unavailable during budget precheck for team={team.team_id}"
             ) from exc
 
         spend = float(raw[0]) if raw[0] is not None else 0.0
-        cap = float(raw[1]) if raw[1] is not None else team.budget_cap_usd
+        cap = team.budget_cap_usd
 
         return BudgetDecision(
             allowed=spend < cap,

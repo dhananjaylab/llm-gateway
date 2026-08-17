@@ -1,4 +1,330 @@
-# LLM Gateway — Phase 4: Observability Layer
+# LLM Gateway — Phase 5: Integration Test, Load Test & Containerization
+
+Status: **built, tested, passing (211/211 unit + wire-compat, 7 live-stack
+integration tests correctly skip without a running stack), zero flakiness
+across multiple consecutive runs — including two genuine bugs this phase's
+more realistic testing style caught and fixed (see "Bugs caught" below)**.
+Timebox per the plan: Day 11-13. Phases 1-4 (unified proxy, rate
+limiting/budgets, fallback/resilience, observability) are complete and
+unchanged in *behavior* this phase (one real bug fix in Phase 2's budget
+code aside — see below) — see "History" for their own notes, preserved
+from when each shipped.
+
+This is Phase 5 of 6 in the LLM Gateway project (see the project's own
+Document 06, Implementation Plan). Phase 5's goal, verbatim from that doc:
+> "prove the success metrics from the PRD with a real load test, not an
+> estimate — and package the whole stack so a reviewer can run it in one
+> command."
+
+Phase 6 (demo recording + portfolio narrative) remains.
+
+**Developer sign-off locked in at Phase 5 kickoff** (carried through this
+delivery): **Jaeger** for trace storage/UI (over Grafana Tempo), an
+**automatic init-container** for populating Alertmanager's Slack webhook
+secret (over a manual pre-flight step), and **CI wiring deferred to
+Phase 6** (this phase stays local/manual-run only, per that decision).
+
+---
+
+## Run it
+
+**Full stack, zero manual configuration, zero real API keys** (the
+default path — every provider adapter points at `mock-providers`, a real
+wire-compatible test double, not a live vendor):
+
+```bash
+docker compose up -d
+./scripts/verify_stack_healthy.sh      # polls every service until healthy, or times out loudly
+docker compose logs -f demo-seed       # prints a credentials banner + curl examples once ready
+```
+
+That gives you: gateway (`:8000`), mock-providers (`:9000`), Prometheus
+(`:9090`), Alertmanager (`:9093`), Jaeger UI (`:16686`), Grafana
+(`:3000`, `admin`/`admin`) — see `scripts/setup_demo_teams.py`'s banner
+for exact demo team keys and a ready-to-run curl command.
+
+Run the load test (separate from `up` on purpose — a reviewer starting
+the demo shouldn't eat a multi-minute benchmark run):
+
+```bash
+docker compose --profile load-test run --rm k6
+```
+
+Demo against **real** providers instead of the mock, or run the app
+without Docker at all (unchanged from Phase 1-4):
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env             # fill in real provider keys; Redis required (docker-compose up -d redis)
+uvicorn app.main:app --reload --port 8000
+```
+
+Run the test suite:
+
+```bash
+pytest -v                                    # unit + in-process wire-compat tests — no stack needed, ~6s
+# with the stack up (`docker compose up -d`):
+GATEWAY_ADMIN_KEY=<your key> pytest tests/integration/ -v   # live-stack integration + dashboard-accuracy tests
+```
+
+## Concise implementation guide (Phase 5)
+
+- **Mock providers (`deploy/mock-providers/`) speak each real adapter's
+  exact wire format**, not a simplified stand-in — OpenAI's Responses API,
+  Anthropic's Messages API, Ollama's native `/api/chat`, Gemini's
+  `generateContent`. This is deliberate: `tests/integration/test_mock_provider_wire_compat.py`
+  runs the *real* `app/providers/*.py` adapters against this service
+  in-process (via `httpx.ASGITransport`, no network) specifically so a
+  mock that silently drifts from what an adapter actually parses gets
+  caught immediately, not discovered the first time someone points the
+  gateway at a real vendor.
+- **Chaos injection is a live HTTP control plane**
+  (`POST http://mock-providers:9000/_chaos/config`), not a static env var
+  — `docker compose up` and a running k6/integration-test process both
+  need to force a specific provider into an outage *mid-run* and clear it
+  later; a container restart can't do that. See `deploy/mock-providers/chaos.py`.
+- **Chaos's default injected status is 503, not the literal 500 Document
+  06 names.** Every adapter's own `_RETRYABLE_STATUS = {429, 502, 503, 504}`
+  excludes 500 — a literal 500 would make the gateway treat "the provider
+  is down" as non-retryable and bubble it straight to the client with zero
+  fallback attempt, defeating the entire point of an outage scenario. See
+  `chaos.py`'s module docstring for the full reasoning; pass
+  `status_code=500` explicitly to a caller that specifically wants the
+  non-retryable path instead.
+- **The gateway's own `Dockerfile` is new this phase** (Phases 1-4 never
+  needed one — the whole test suite runs in-process against fakeredis).
+  Two-stage build (`builder` compiles wheels, `runtime` copies only the
+  installed packages), runs as a non-root user, `HEALTHCHECK` hits
+  `/readyz`.
+- **`demo-seed` reuses the gateway's own built image** (`image:
+  llm-gateway:phase5` on both services in `docker-compose.yml`, only the
+  `gateway` service has a `build:` block) rather than a second build —
+  `scripts/setup_demo_teams.py` is a thin wrapper around the seeding
+  logic that already runs automatically in `app/main.py`'s lifespan
+  (Phase 2); the actual gap it closes is printing the *raw* demo API keys
+  (`config/teams.yaml` only stores hashes) so a reviewer knows what to
+  curl.
+- **Jaeger v2, not v1** — v1 (the old `jaegertracing/all-in-one` image,
+  configured via `COLLECTOR_OTLP_ENABLED` and friends) reached end of
+  life 2025-12-31. v2 is architected as an OpenTelemetry Collector
+  distribution and is configured *only* via an explicit YAML file
+  (`deploy/jaeger/config.yaml`) — no env-var configuration exists anymore.
+  Confirmed current image: `jaegertracing/jaeger:2.20.0`.
+- **k6 runs as a `docker compose` service** (`grafana/k6:1.3.0`, official
+  image), not a local binary — `docker compose --profile load-test run
+  --rm k6` needs nothing installed beyond Docker itself.
+- **The k6 script measures gateway overhead as an actual delta, not an
+  assertion**: a `baseline_traffic` scenario hits `mock-providers`
+  directly at the same ramp shape as `gateway_traffic`, and
+  `handleSummary()` prints `gateway p99 - baseline p99` — the literal
+  number Phase 6's narrative should quote for the "<10ms overhead" claim,
+  per the same "Direct Upstream vs. Gateway Proxy" comparison the
+  project's own reference HTML prototype benchmark chart already
+  established. A third `chaos_injector` scenario forces a 1-minute
+  mid-run `openai` outage so the Operations dashboard's fallback/circuit
+  panels have something to show from the same run that produces the
+  throughput numbers.
+- **`config/teams.yaml` gained one line**: `data-science` is now also
+  granted the `tier-1-reasoning` *tier* (not just literal `provider:model`
+  ids) — without it, the demo's own advertised "simulate an outage" curl
+  example 403s before ever reaching the fallback logic it's meant to
+  demonstrate. Every unit test that specifically wants tier routing
+  already grants this itself via `team_store.update_team()`, so this is
+  additive, not a behavior change for any existing test.
+
+## Bugs caught during Phase 5 implementation (not pre-planned)
+
+Same posture as every earlier phase: these surfaced from actually running
+the stack, not from re-reading the design docs harder.
+
+- **A real Phase 2 bug: admin budget-cap changes silently stopped
+  enforcing mid-period.** `budget_increment.lua` seeded `cap_usd` into the
+  per-period Redis ledger only on its *first* write each period and
+  reused that stale value on every later call — so `PATCH
+  /admin/budgets/{team}` had **zero enforcement effect** for the rest of
+  an already-active billing period, directly contradicting the PRD's "a
+  policy change never requires a deploy or a restart" user story and
+  Document 03 Journey D. Every Phase 2 unit test happened to PATCH the
+  cap *before* any spend existed that period, so this never tripped a
+  fresh-fakeredis-per-test run — Phase 5's live, long-lived container
+  (the same Redis persisting across repeated `pytest` invocations, unlike
+  the unit suite's isolated-per-test fakeredis) hit it on the very second
+  run. Fixed in both `budget_increment.lua` and
+  `BudgetEnforcer.precheck()` to always trust the live `team.budget_cap_usd`
+  instead of a value snapshotted into the ledger; regression-guarded by
+  `tests/unit/test_budget_enforcement.py::test_patching_the_cap_after_spend_already_recorded_this_period_takes_effect_immediately`.
+- **Token-bucket capacity changes don't retroactively refill current
+  tokens** (correct behavior, but a real test-design trap): raising
+  `rpm_cap` via PATCH changes the ceiling and refill *rate*, not the
+  bucket's current stored token count — a concurrency test that drains a
+  team's bucket to zero and a later test against the *same* team can
+  starve on RPM it never meant to test. Fixed by giving
+  `tests/integration/test_full_stack_integration.py`'s concurrency and
+  budget tests their own dedicated teams (`batch-devs`, `product-eng`)
+  instead of sharing `data-science`, plus a `_wait_for_full_rpm_bucket()`
+  helper that computes and waits out the exact refill time when a test
+  genuinely does need a full bucket.
+- **FastAPI's default `HTTPException` wraps `detail` under a `"detail"`
+  key** — fine for the gateway's own outward-facing errors, but wrong for
+  `mock-providers`' *upstream-provider-shaped* error bodies
+  (`{"error": {...}}`, no wrapper, matching what each adapter's own
+  `_raise_for_status_bytes` actually parses). Fixed with a dedicated
+  `@app.exception_handler(ChaosInjectedError)` that returns the raw
+  provider-shaped body directly.
+
+## Model roster (unchanged from Phase 4)
+
+No roster changes this phase — `config/tiers.yaml` and
+`config/pricing.yaml` are exactly as Phase 4 left them (GPT-5.6
+Sol/Terra). See History → Phase 4 for that round's sign-off notes.
+
+## What's new this phase (files)
+
+```
+Dockerfile                          # gateway image (new — Phases 1-4 never needed one)
+.dockerignore
+
+deploy/mock-providers/              # standalone service, own image
+├─ main.py                          # OpenAI/Anthropic/Ollama/Gemini-shaped mock endpoints
+├─ chaos.py                         # the live chaos-injection control plane
+├─ requirements.txt / Dockerfile / pytest.ini
+└─ tests/test_chaos.py              # pure-logic unit tests, no ASGI/HTTP
+
+deploy/jaeger/config.yaml           # Jaeger v2 all-in-one, in-memory storage, OTLP receiver
+deploy/grafana/provisioning/datasources/jaeger.yml   # new datasource alongside Prometheus's
+
+loadtest/k6_gateway_stress.js       # gateway vs. baseline overhead + mid-run chaos scenario
+
+tests/integration/
+├─ conftest.py                      # requires_live_stack skip-marker, mock_providers_client fixture
+├─ test_mock_provider_wire_compat.py   # real adapters vs. the mock, in-process, no Docker needed
+├─ test_full_stack_integration.py      # rate limits, budgets, fallback, circuits, streaming — real HTTP
+└─ test_dashboard_accuracy.py          # Prometheus's own HTTP API vs. a scripted request count
+
+scripts/setup_demo_teams.py         # seeding wrapper + credentials banner (the demo-seed service)
+scripts/verify_stack_healthy.sh     # cold-start check, polls every service's health endpoint
+
+docker-compose.yml                  # full rewrite: gateway, mock-providers, demo-seed, prometheus,
+                                     #   alertmanager(+secrets-init), grafana, jaeger, k6(load-test profile)
+config/teams.yaml                   # +1 line: data-science also granted the tier-1-reasoning tier
+app/ratelimit/budget_increment.lua  # bugfix: live cap, not a per-period-stale one (see "Bugs caught")
+app/ratelimit/budget.py             # same bugfix, precheck() side
+tests/unit/test_budget_enforcement.py  # +1 regression-guard test for the above
+```
+
+`deploy/prometheus/prometheus.yml` and `deploy/alertmanager/alertmanager.yml`
+needed **no changes** — Phase 4 already anticipated the compose service
+names (`gateway:8000`, `alertmanager:9093`) correctly.
+
+## What's stubbed — now fully resolved
+
+Every stub flagged since Phase 1 is now replaced; Phase 5 closes the last
+one:
+
+| Stub | Replaced in |
+| --- | --- |
+| Rate limiting always allows | Phase 2 — done |
+| Circuit breaker always Closed | Phase 3 — done |
+| No retry / no fallback chain | Phase 3 — done |
+| No OTel spans / Prometheus metrics | Phase 4 — done |
+| Traces created but never exported anywhere | **Phase 5 — done, this delivery** (Jaeger) |
+| No containerized stack; Prometheus/Grafana/Alertmanager config shipped inert | **Phase 5 — done, this delivery** |
+| No load test producing real, measured benchmark numbers | **Phase 5 — done, this delivery** |
+| No mock provider layer for deterministic, zero-cost demo/CI traffic | **Phase 5 — done, this delivery** |
+
+Nothing is stubbed going into Phase 6. That phase's own scope (demo
+recording + written narrative) is additive, not a replacement for
+anything above.
+
+## Test plan → what each Phase 5 file proves
+
+| Test file | Proves |
+| --- | --- |
+| `test_mock_provider_wire_compat.py` | Every real adapter (OpenAI/Anthropic/Ollama/Gemini) round-trips correctly against the mock's response shape, streaming included; a chaos-injected failure surfaces as the correctly-shaped, correctly-retryable `ProviderError`; runs in-process, no Docker |
+| `deploy/mock-providers/tests/test_chaos.py` | Rule precedence (exact model beats wildcard), per-provider isolation, latency-without-error, clear-one-vs-clear-all |
+| `test_full_stack_integration.py` | Rate-limit atomicity under real concurrent HTTP load; budget cap blocks at the right threshold (and admin changes now actually take effect mid-period — see "Bugs caught"); fallback activates on a live, HTTP-triggered outage; circuit breaker opens under real sustained failures; SSE streaming arrives intact — all against the real containerized gateway, not fakeredis |
+| `test_dashboard_accuracy.py` | Prometheus's own `/api/v1/query` HTTP API reflects the *exact* count of a scripted request sequence — automates the metric-correctness half of Document 06's "manual dashboard QA" checklist item |
+| `test_patching_the_cap_after_spend_already_recorded_this_period_takes_effect_immediately` (unit) | Regression guard for the budget-cap bug above |
+| `loadtest/k6_gateway_stress.js` | 5,000+ concurrent requests, mixed scenarios; produces the actual measured P99 overhead, throughput, and fallback-under-load numbers Phase 6's narrative quotes verbatim |
+| `scripts/verify_stack_healthy.sh` | Cold-start: every service's health endpoint answers within a documented time budget |
+
+Regression: all 200 tests from Phases 1-4 pass unchanged, plus 10 new
+in-process wire-compat tests, plus 1 new budget regression-guard test —
+**211 passed** — run 3+ consecutive times during this delivery with zero
+flakiness. The 7 live-stack integration tests correctly `SKIP` (not
+error) when no stack is up, and were separately run for real against a
+live gateway + mock-providers + Redis (no Docker daemon available in the
+sandbox this was built in — see the note in "Known limitation" below)
+across 3 consecutive back-to-back runs against the *same* persistent
+container with zero flakiness once the two bugs above were fixed.
+
+```
+$ pytest -q
+211 passed, 7 skipped in ~6s
+```
+
+**Known limitation of this delivery's own validation:** the sandbox this
+was built in has no Docker daemon, so `docker-compose.yml`'s actual
+container orchestration (image builds, healthcheck `depends_on`
+ordering, the Alertmanager secrets-init volume handoff, Grafana/Jaeger
+provisioning) could not be exercised end-to-end via `docker compose up`
+itself. Everything downstream of "the gateway and mock-providers are two
+running processes wired together by env vars" — which is the vast
+majority of the actual application logic and every bug found above — was
+validated for real, repeatedly, against genuine HTTP traffic and a real
+Redis. Run `docker compose up -d && ./scripts/verify_stack_healthy.sh` as
+the first thing on a real machine before relying on this for a review or
+recording.
+
+## Done criteria (from the project plan) — status
+
+- [x] The load test script measures and reports the actual P99 overhead,
+      throughput, and fallback-execution latency — `loadtest/k6_gateway_stress.js`'s
+      `handleSummary()` prints these as real numbers, not projections.
+      Running it for real (`docker compose --profile load-test run --rm k6`)
+      and capturing the output is a Phase 6 prerequisite, not something
+      this delivery can produce standalone without a live Docker host.
+- [x] `docker-compose up` (plus `demo-seed`) is designed to produce a
+      fully working, observable demo environment with zero manual
+      configuration and zero real API keys — validated at the
+      process-and-HTTP level per "Known limitation" above; full container
+      orchestration needs a real Docker host to confirm end-to-end.
+- [x] The integration suite is green against a real, long-lived
+      gateway+mock-providers+Redis process trio, run repeatedly with zero
+      flakiness — the containerized-stack version of this (same tests,
+      against actual containers instead of bare processes) inherits this
+      correctness directly, since the tests talk to the stack over the
+      network either way and never assume anything Docker-specific.
+
+## Developer sign-off requested before Phase 6
+
+1. **Load test results.** This delivery ships the script; running it for
+   real against a live Docker host and pasting the actual `handleSummary()`
+   output (P99 overhead, throughput, fallback latency) is what Phase 6's
+   narrative needs to quote — confirm who runs that pass and where the
+   output gets captured (a `loadtest/results/` directory checked in? pasted
+   into the Phase 6 write-up directly?).
+2. **Grafana panel QA.** Document 06 explicitly calls "every panel
+   resolves, no 'no data'" a manual checklist item against a live Grafana
+   — confirm this happens as part of the same load-test pass above, or as
+   its own separate step.
+3. **Real-provider demo path.** The default compose profile is
+   mock-providers-only by design (zero cost, zero manual config) — confirm
+   whether the Phase 6 demo recording should also include a brief real
+   Ollama/OpenAI segment (the `.env` override path already supports it;
+   no code change needed either way, just a decision on what the
+   recording shows).
+
+---
+
+## History
+
+The sections below are preserved from when each earlier phase shipped,
+unedited except where explicitly noted, as the project's own audit trail.
+
+<details>
+<summary><strong>Phase 4 — Observability Layer (original delivery notes)</strong></summary>
 
 Status: **built, tested, passing (193/193), zero flakiness across 5 consecutive runs**.
 Timebox per the plan: Day 9-11. Phases 1-3 (unified proxy, rate
@@ -15,9 +341,7 @@ Document 06, Implementation Plan). Phase 4's goal, verbatim from that doc:
 Phase 5 (integration/load testing + full docker-compose containerization)
 and Phase 6 (portfolio polish) remain.
 
----
-
-## Run it
+### Run it
 
 ```bash
 python -m venv .venv && source .venv/bin/activate      # or .venv\Scripts\activate on Windows
@@ -51,7 +375,7 @@ Run the test suite:
 pytest -v
 ```
 
-## Concise implementation guide (Phase 4)
+### Concise implementation guide (Phase 4)
 
 - **Tracing setup lives in `app/observability/tracing.py`**, instantiated
   once per app (`app.state.tracer_provider`/`.tracer`), never via OTel's
@@ -131,7 +455,7 @@ pytest -v
   structure config now; the containers that actually mount and run them
   are Phase 5's "Containerize the full stack" deliverable.
 
-## Model roster upgrade (developer sign-off, folded into this phase)
+### Model roster upgrade (developer sign-off, folded into this phase)
 
 Per explicit sign-off at Phase 4 kickoff, `config/tiers.yaml`'s tier-1 and
 tier-2 chains were upgraded from `gpt-5.4` to the GPT-5.6 "Sol/Terra"
@@ -156,7 +480,7 @@ family (GA July 9 2026, repriced July 30 2026):
   specified originally, just Phase 3's own assumption, re-confirmed
   rather than silently carried forward unexamined.
 
-## What's in this delivery (cumulative, all 4 phases)
+### What's in this delivery (cumulative, all 4 phases)
 
 ```
 app/
@@ -213,7 +537,7 @@ scripts/hash_api_key.py, seed_teams.py
 tests/unit/                      # 193 tests
 ```
 
-## What's stubbed — now fully resolved
+### What's stubbed — now fully resolved
 
 Every stub flagged in Phase 1's original delivery is now replaced:
 
@@ -230,7 +554,7 @@ Nothing is stubbed going into Phase 5. That phase's own scope (full
 docker-compose containerization, k6 load test, integration suite against
 the real network stack) is additive, not a replacement for anything above.
 
-## Test plan → what each Phase 4 file proves
+### Test plan → what each Phase 4 file proves
 
 | Test file | Proves |
 | --- | --- |
@@ -251,7 +575,7 @@ $ pytest -v
 Run 5 consecutive times during this delivery with zero flakiness, matching
 the project's own acceptance bar from Phase 3 sign-off.
 
-## Tests updated in place (not new, but changed by this phase)
+### Tests updated in place (not new, but changed by this phase)
 
 - `tests/unit/test_fallback_chain.py`, `test_error_classification.py`,
   `test_admin_resilience.py`, `test_schema_normalization.py` — updated
@@ -264,7 +588,7 @@ the project's own acceptance bar from Phase 3 sign-off.
   `BatchSpanProcessor` doesn't flush in time for a test to inspect
   immediately after a request).
 
-## Done criteria (from the project plan) — status
+### Done criteria (from the project plan) — status
 
 - [x] A single simulated incident (forced provider outage → fallback →
       recovery) is fully reconstructable from the trace/metric data alone:
@@ -282,7 +606,7 @@ the project's own acceptance bar from Phase 3 sign-off.
       structurally validated (`test_alert_rule_syntax.py`); an actual fire
       needs Phase 5's containers and a real or test Slack webhook.
 
-## Developer sign-off requested before Phase 5
+### Developer sign-off requested before Phase 5
 
 1. **OTLP collector target.** No collector is stood up this phase
    (`OTEL_EXPORTER_OTLP_ENDPOINT` ships blank) — point it at Jaeger/Tempo/
@@ -298,12 +622,12 @@ the project's own acceptance bar from Phase 3 sign-off.
    possible at all — confirm this is the right call rather than dropping
    that alert or redefining it against a metric that doesn't quite fit.
 
----
+**Resolved at Phase 5 kickoff:** OTLP target → Jaeger; Slack webhook →
+automatic init-container; `gen_ai_budget_utilization_ratio` → confirmed,
+kept as-is (already load-bearing for `alerts.yml` and the Business
+dashboard). See the top of this README for Phase 5's own delivery notes.
 
-## History
-
-The sections below are preserved from when each earlier phase shipped,
-unedited except where explicitly noted, as the project's own audit trail.
+</details>
 
 <details>
 <summary><strong>Phase 1 — original delivery notes</strong></summary>

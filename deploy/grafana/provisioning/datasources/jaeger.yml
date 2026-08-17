@@ -1,0 +1,17 @@
+# Grafana datasource provisioning for Jaeger -- classic file-based
+# provisioning, same mechanism as prometheus.yml alongside this file (see
+# that file's own header for why classic provisioning, not Git Sync, is
+# the right tool here). Points at Jaeger's query HTTP API (port 16686),
+# not the OTLP ingest ports (4317/4318) -- those are where the gateway
+# WRITES traces to, this is where Grafana READS them back from.
+
+apiVersion: 1
+
+datasources:
+  - name: Jaeger
+    uid: jaeger
+    type: jaeger
+    access: proxy
+    url: http://jaeger:16686
+    isDefault: false
+    editable: false

@@ -1,0 +1,46 @@
+# Phase 6 CI wiring addition. This repo's own convention (README, every
+# requirements.txt / docker-compose.yml image tag) is "search first, pin
+# exact versions, re-verify monthly" — done entirely by hand through Phase
+# 5. Dependabot doesn't replace that judgment (a bumped major version still
+# needs a human to read the changelog, same as every "VERSION NOTE" comment
+# already in this repo), but it turns "re-verify monthly" from a thing
+# someone has to remember into a PR that shows up on its own.
+#
+# Four ecosystems, matching the repo's four places a version gets pinned:
+# the gateway's own requirements.txt, mock-providers' separate
+# requirements.txt (deliberately its own dependency set — see that file's
+# header), the two Dockerfiles' base images, and the GitHub Actions
+# workflows this Phase 6 delivery just added.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "gateway"]
+
+  - package-ecosystem: "pip"
+    directory: "/deploy/mock-providers"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "mock-providers"]
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "docker"]
+
+  - package-ecosystem: "docker"
+    directory: "/deploy/mock-providers"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "docker"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "ci"]

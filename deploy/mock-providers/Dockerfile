@@ -1,7 +1,7 @@
 # Standalone image -- no build context beyond this directory (see its
 # reference in docker-compose.yml: `build: { context: ./deploy/mock-providers }`),
 # so it never accidentally picks up the gateway's own app/ package.
-FROM python:3.13-slim
+FROM python:3.14-slim
 
 WORKDIR /srv
 

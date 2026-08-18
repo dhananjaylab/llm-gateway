@@ -1,0 +1,137 @@
+# Phase 6 CI wiring, part 2 — the heavy workflow.
+#
+# Deliberately SEPARATE from ci.yml (see that file's header): this brings up
+# all 10 docker-compose services (gateway, mock-providers, Redis, Prometheus,
+# Alertmanager, Grafana, Jaeger, demo-seed) on a GitHub-hosted runner and
+# runs the real live-stack integration suite (tests/integration/, the 7
+# tests that correctly SKIP in ci.yml) plus, on a schedule/manual trigger
+# only, the k6 load test. Running this on every PR would make routine
+# reviews wait on a multi-minute container bring-up; running it on every
+# push to main catches "the containerized stack is actually broken" close
+# to when it happens without slowing down PR feedback.
+#
+# GitHub-hosted `ubuntu-latest` runners: 4 vCPU / 16 GB RAM as of this pass
+# (2-core/7GB was the older default — re-verify at
+# https://docs.github.com/actions/using-github-hosted-runners/about-github-hosted-runners
+# if this job starts OOM-killing Prometheus/Grafana/Jaeger under load,
+# since that spec is GitHub's to change, not this repo's). Comfortably fits
+# all 10 services; the k6 load-test job below still gets its own bigger
+# timeout because 5,000+ concurrent requests is genuinely slow on a shared
+# runner, not because of memory.
+name: Integration (docker-compose)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_load_test:
+        description: "Also run the k6 load test profile (slow — several minutes)"
+        type: boolean
+        default: false
+  schedule:
+    # Weekly, not nightly — this workflow's whole point is catching
+    # container-level drift (base image updates, provider API shape
+    # changes reflected in the mock, dependency bumps), which doesn't
+    # need daily cadence for a portfolio project with no production
+    # traffic. Cheap enough to run more often; tune freely.
+    - cron: "17 6 * * 1" # Mondays, 06:17 UTC
+
+concurrency:
+  group: integration-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  live-stack:
+    name: Live-stack integration suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GATEWAY_ADMIN_KEY: ci-admin-key-not-a-secret
+      GATEWAY_BASE_URL: http://localhost:8000
+      MOCK_PROVIDERS_BASE_URL: http://localhost:9000
+      PROMETHEUS_BASE_URL: http://localhost:9090
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - run: pip install -r requirements.txt
+
+      - uses: docker/setup-buildx-action@v4
+
+      # `docker compose up -d` builds the gateway + mock-providers images
+      # from source (no registry pull needed — see docker-compose.yml's
+      # `build:` blocks) and starts every service, including the one-shot
+      # `demo-seed` container. GATEWAY_ADMIN_KEY is set to a CI-only,
+      # publicly-visible placeholder on purpose (matches the repo's own
+      # documented default in docker-compose.yml: `${GATEWAY_ADMIN_KEY:-dev-admin-key-change-me}`)
+      # — nothing this stack talks to is a real credential; see
+      # docker-compose.yml's own comments on why the default provider keys
+      # are `mock-key` pointed at mock-providers, not real vendor keys.
+      - name: docker compose up
+        run: docker compose up -d --build
+
+      - name: Wait for every service to report healthy
+        run: |
+          chmod +x scripts/verify_stack_healthy.sh
+          TIMEOUT_SECONDS=180 ./scripts/verify_stack_healthy.sh
+
+      - name: Run the live-stack integration suite
+        run: pytest tests/integration/ -v
+
+      - name: Dump service logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail=200
+
+      - name: docker compose down
+        if: always()
+        run: docker compose down -v
+
+  load-test:
+    name: k6 load test (opt-in)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Only when someone deliberately asks for it via workflow_dispatch — see
+    # docs/PHASE6_DEMO_RECORDING_GUIDE.md for why this is also the exact
+    # command a human runs locally before recording the Phase 6 demo. This
+    # job exists so the same numbers can be captured from CI as a
+    # documented, repeatable run, not just a developer's laptop.
+    if: github.event_name == 'workflow_dispatch' && inputs.run_load_test
+    needs: live-stack
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+
+      - name: docker compose up
+        run: docker compose up -d --build
+
+      - name: Wait for every service to report healthy
+        run: |
+          chmod +x scripts/verify_stack_healthy.sh
+          TIMEOUT_SECONDS=180 ./scripts/verify_stack_healthy.sh
+
+      - name: Run k6 load test
+        run: docker compose --profile load-test run --rm k6 | tee k6-output.txt
+
+      - name: Upload k6 summary
+        uses: actions/upload-artifact@v7
+        with:
+          name: k6-load-test-summary
+          path: k6-output.txt
+          retention-days: 90
+
+      - name: Dump service logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail=200
+
+      - name: docker compose down
+        if: always()
+        run: docker compose down -v

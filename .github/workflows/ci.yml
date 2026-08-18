@@ -1,0 +1,127 @@
+# Phase 6 CI wiring — flagged as deferred at Phase 5 sign-off, delivered here.
+#
+# Scope decision (Phase 6 kickoff): this is the FAST workflow, on every push
+# and every PR against main. It answers "is this change safe to merge" in
+# under two minutes, with zero external services — matching the same
+# no-Docker-needed property the unit suite has always had (see README:
+# "pytest -v ... no stack needed, ~6s"). It does NOT run docker-compose or
+# the live-stack integration suite — that's .github/workflows/integration.yml,
+# deliberately a separate, heavier workflow so a routine PR isn't blocked on
+# spinning up 8 containers.
+#
+# Action versions pinned below were current as of the Phase 6 "search first"
+# pass (Aug 2026): actions/checkout@v7, actions/setup-python@v7,
+# docker/setup-buildx-action@v4, docker/build-push-action@v7,
+# docker/login-action@v4. Re-verify with `gh api` or the Marketplace page
+# before this workflow goes stale — same "search first" convention every
+# other pinned version in this repo already follows (see requirements.txt,
+# docker-compose.yml's image tags).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - run: pip install ruff
+
+      # KNOWN OPEN ITEM (flagged at Phase 6 kickoff, not silently fixed by
+      # this workflow): `ruff check .` on main currently reports 11
+      # pre-existing findings (7 auto-fixable with `ruff check --fix`,
+      # mostly nested `with` statements in the OpenAI/Anthropic/Ollama
+      # adapters' streaming code and a couple of stale `noqa: SLF001`
+      # comments left over from earlier phases — see
+      # docs/PHASE6_CI_IMPLEMENTATION_GUIDE.md for the full list). None
+      # touch runtime behavior. `continue-on-error: true` here means this
+      # job reports its findings (visible in the Actions tab and job
+      # summary) without going red and blocking every future PR on a
+      # cleanup that's this repo's own call to schedule, not this
+      # workflow's to force. Flip to `false` once that cleanup lands —
+      # tracked as a Phase 6 sign-off item, not fixed unilaterally here.
+      - name: ruff check
+        continue-on-error: true
+        run: ruff check . --output-format=github
+
+  test:
+    name: Unit + wire-compat tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - run: pip install -r requirements.txt
+
+      # No Redis, no Docker, no live providers — fakeredis + the mock
+      # adapters' own in-process wire-compat tests cover this (see
+      # tests/unit/conftest.py and tests/integration/test_mock_provider_wire_compat.py).
+      # Expected: 211 passed, 7 skipped (the 7 are test_full_stack_integration.py
+      # / test_dashboard_accuracy.py's live-stack tests, correctly skipping
+      # because GATEWAY_BASE_URL isn't reachable in this job).
+      #
+      # Deliberately no third-party test-reporting action here (e.g. a JUnit
+      # summary uploader) — pytest's own console output is already what the
+      # Actions log shows, and this workflow only pins actions this pass
+      # explicitly confirmed current (actions/checkout, actions/setup-python,
+      # Docker's own actions below). Add one later if the team wants a rich
+      # PR-comment summary; it's an enhancement, not a Phase 6 requirement.
+      - name: pytest
+        run: pytest -v
+
+  docker-build:
+    name: Docker image build check (${{ matrix.image.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: gateway
+            context: .
+            dockerfile: Dockerfile
+          - name: mock-providers
+            context: ./deploy/mock-providers
+            dockerfile: deploy/mock-providers/Dockerfile
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      # push:false on every trigger, including pushes to main — this job's
+      # only job is "does the Dockerfile still build," not publishing an
+      # image anywhere. A registry-publish job is a deliberate non-goal for
+      # a portfolio project with no deployment target; add one (GHCR is the
+      # zero-config option, `docker/login-action@v4` +
+      # `password: ${{ secrets.GITHUB_TOKEN }}`) if that ever changes.
+      - name: Build (no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.dockerfile }}
+          push: false
+          tags: llm-gateway-${{ matrix.image.name }}:ci
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}

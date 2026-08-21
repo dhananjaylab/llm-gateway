@@ -1,7 +1,7 @@
 fastapi[standard]>=0.136,<0.138
 uvicorn[standard]>=0.34,<0.35
 pydantic>=2.13,<3
-httpx>=0.28,<0.29
+httpx>=0.28.1,<0.29
 pyyaml>=6.0,<7
 python-dotenv>=1.0,<2
 redis>=8.1,<9

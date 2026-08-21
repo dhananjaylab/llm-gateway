@@ -203,16 +203,24 @@ def provider_call_span(
         yield span
 
 
-def set_span_success(span: Span | None, *, response_model: str, usage=None) -> None:
+def set_span_success(
+    span: Span | None, *, response_model: str, usage=None, cost_usd: float | None = None
+) -> None:
     """Document 05: CLIENT span on success carries gen_ai.response.model
     and usage counts; span status OK (Journey B's second, successful
-    attempt)."""
+    attempt). Phase 7: also carries gen_ai.usage.cost_usd when the caller
+    can compute it (FallbackRouter, when constructed with a pricing_table
+    — see fallback.py's module docstring) — a custom extension attribute,
+    same category as gen_ai.client.team_id, not part of the Stable core
+    schema."""
     if span is None:
         return
     span.set_attribute("gen_ai.response.model", response_model)
     if usage is not None:
         span.set_attribute("gen_ai.usage.input_tokens", usage.input_tokens)
         span.set_attribute("gen_ai.usage.output_tokens", usage.output_tokens)
+    if cost_usd is not None:
+        span.set_attribute("gen_ai.usage.cost_usd", cost_usd)
     span.set_status(Status(StatusCode.OK))
 
 

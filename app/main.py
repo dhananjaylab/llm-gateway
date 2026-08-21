@@ -49,8 +49,9 @@ from app.core.redis_client import build_redis_client
 from app.core.team_store import TeamConfigStore
 from app.observability.metrics import build_metrics
 from app.observability.tracing import init_tracing
-from app.providers.registry import all_configured_provider_models, resolve_model
+from app.providers.registry import all_configured_provider_models, close_all_adapters, resolve_model
 from app.ratelimit.budget import BudgetEnforcer
+from app.ratelimit.combined import CombinedQuotaChecker
 from app.ratelimit.limiter import RateLimiter
 from app.ratelimit.priority_queue import BatchPriorityQueue
 from app.resilience.circuit_breaker import CircuitBreaker
@@ -114,6 +115,19 @@ def _build_lifespan(redis_client_override: Redis | None):
         app.state.budget_enforcer = BudgetEnforcer(
             redis_client, warn_fraction=settings.budget_warn_fraction, metrics=app.state.metrics
         )
+        # Phase 7: single-round-trip fast path for the normal/high-priority
+        # hot path, wrapping the two objects above rather than replacing
+        # them — the batch-priority path (BatchPriorityQueue below) keeps
+        # calling rate_limiter.check() directly, and CombinedQuotaChecker's
+        # own Redis-outage fallback calls budget_enforcer.precheck() +
+        # rate_limiter.check() exactly as before. See
+        # app/ratelimit/combined.py's module docstring.
+        app.state.combined_quota_checker = CombinedQuotaChecker(
+            redis_client,
+            rate_limiter=app.state.rate_limiter,
+            budget_enforcer=app.state.budget_enforcer,
+            rl_key_ttl_seconds=settings.rate_limit_key_ttl_seconds,
+        )
         app.state.batch_queue = BatchPriorityQueue(
             redis_client,
             max_wait_seconds=settings.batch_queue_max_wait_seconds,
@@ -132,6 +146,10 @@ def _build_lifespan(redis_client_override: Redis | None):
             window_size=settings.circuit_breaker_window_size,
             cooldown_seconds=settings.circuit_breaker_cooldown_seconds,
             metrics=app.state.metrics,
+            mode=settings.circuit_breaker_mode,
+            error_rate_window_seconds=settings.circuit_breaker_error_rate_window_seconds,
+            error_rate_threshold=settings.circuit_breaker_error_rate_threshold,
+            error_rate_minimum_samples=settings.circuit_breaker_error_rate_minimum_samples,
         )
         app.state.health_tracker = HealthTracker(
             redis_client,
@@ -153,6 +171,7 @@ def _build_lifespan(redis_client_override: Redis | None):
             tracer=app.state.tracer,
             metrics=app.state.metrics,
             capture_content=settings.otel_capture_message_content,
+            pricing_table=app.state.pricing,
         )
 
         seeded = await app.state.team_store.seed_from_yaml_if_empty(load_teams_config())
@@ -195,6 +214,13 @@ def _build_lifespan(redis_client_override: Redis | None):
             # added as a processor (otlp_endpoint unset AND no test
             # override) -- shutdown() on an empty provider is safe.
             app.state.tracer_provider.shutdown()
+            # Phase 7: close every provider adapter's shared, pooled
+            # httpx.AsyncClient (the counterpart to constructing it once
+            # in each adapter's __init__ instead of once per call — see
+            # app/providers/registry.py::close_all_adapters and
+            # docs/PHASE7_IMPLEMENTATION_GUIDE.md). A no-op if no chat
+            # request was ever routed this process lifetime.
+            await close_all_adapters()
             if owns_redis:
                 await redis_client.aclose()
 

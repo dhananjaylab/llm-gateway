@@ -123,8 +123,11 @@ class _NoopRateLimiter:
 
 
 class _NoopBudgetEnforcer:
+    def __init__(self) -> None:
+        self.record_spend_calls: list[float] = []
+
     async def record_spend(self, team, cost_usd) -> None:
-        return None
+        self.record_spend_calls.append(cost_usd)
 
 
 def _redis_free_fallback_router() -> FallbackRouter:
@@ -156,6 +159,7 @@ async def test_client_disconnect_cancels_the_upstream_call(monkeypatch):
         policy=TeamPolicy(),
     )
     rate_limiter = _NoopRateLimiter()
+    budget_enforcer = _NoopBudgetEnforcer()
     fallback_router = _redis_free_fallback_router()
 
     received: list = []  # list[str], the SSE-frame strings _stream_response yields
@@ -168,7 +172,7 @@ async def test_client_disconnect_cancels_the_upstream_call(monkeypatch):
         team=team,
         reserved_tokens=42,
         rate_limiter=rate_limiter,
-        budget_enforcer=_NoopBudgetEnforcer(),
+        budget_enforcer=budget_enforcer,
         pricing_table={},
     ):
         received.append(event)
@@ -185,8 +189,20 @@ async def test_client_disconnect_cancels_the_upstream_call(monkeypatch):
     # the raw adapter stream when v1_chat.py's outer `agen.aclose()` (also
     # a `finally`) closes the fallback-aware wrapper generator around it.
     assert adapter.stream_closed is True
-    # Phase 2 behavior, unchanged: the reservation is still reconciled
-    # (refunded) even though the stream was cut short — actual_tokens=0
-    # since no usage chunk ever arrived (the terminal usage chunk was
-    # never reached).
-    assert rate_limiter.reconcile_calls == [(42, 0)]
+    # Phase 7 behavior (changed from Phase 2's blanket-zero refund): the
+    # one chunk that DID reach the client ("c0", via the "fake" provider,
+    # which falls through to the project's existing 4-chars/token
+    # heuristic in app/ratelimit/output_tokenizer.py) is estimated at 1
+    # output token, plus the pre-flight input estimate for "hi" (1 token)
+    # — so the reservation is now reconciled against 2 actual tokens, not
+    # a blanket 0. See docs/PHASE7_IMPLEMENTATION_GUIDE.md ("Advanced
+    # Token Accounting for Cancelled and Aborted Streams") and
+    # _reconcile_and_bill_partial in app/api/v1_chat.py.
+    assert rate_limiter.reconcile_calls == [(42, 2)]
+    # And — the actual financial-leakage fix — the partial content is now
+    # billed to the team's budget instead of silently never recorded.
+    # cost_usd is 0.0 here only because pricing_table={} has no entry for
+    # the "fake" provider (see the captured warning log); the call
+    # happening at all, with a real (estimated) Usage behind it, is the
+    # behavior under test.
+    assert budget_enforcer.record_spend_calls == [0.0]

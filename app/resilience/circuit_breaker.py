@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -97,6 +98,10 @@ class CircuitBreaker:
         cooldown_seconds: float = 60.0,
         clock=time.time,
         metrics: GatewayMetrics | None = None,
+        mode: str = "fixed_count",
+        error_rate_window_seconds: float = 30.0,
+        error_rate_threshold: float = 0.5,
+        error_rate_minimum_samples: int = 5,
     ) -> None:
         self._redis = redis
         self._failure_threshold = failure_threshold
@@ -104,12 +109,27 @@ class CircuitBreaker:
         self._cooldown = cooldown_seconds
         self._clock = clock
         self._metrics = metrics
+        # Phase 7: the v2 extension TRD Appendix A anticipated ("move to a
+        # rolling error-rate percentage only if the fixed threshold proves
+        # too twitchy"). Default unchanged ("fixed_count") so constructing
+        # a CircuitBreaker without passing `mode` is a zero-behavior-change
+        # no-op — every Phase 1-6 test that builds one directly keeps
+        # working unmodified. See circuit_record_error_rate.lua's own
+        # header for why circuit_check.lua itself needs no mode branch at
+        # all.
+        self._mode = mode
+        self._error_rate_window_seconds = error_rate_window_seconds
+        self._error_rate_threshold = error_rate_threshold
+        self._error_rate_minimum_samples = error_rate_minimum_samples
 
         check_text = (_SCRIPT_DIR / "circuit_check.lua").read_text(encoding="utf-8")
         self._check_script = LuaScript(redis, check_text, name="circuit_check")
 
-        record_text = (_SCRIPT_DIR / "circuit_record.lua").read_text(encoding="utf-8")
-        self._record_script = LuaScript(redis, record_text, name="circuit_record")
+        record_filename = (
+            "circuit_record_error_rate.lua" if mode == "error_rate" else "circuit_record.lua"
+        )
+        record_text = (_SCRIPT_DIR / record_filename).read_text(encoding="utf-8")
+        self._record_script = LuaScript(redis, record_text, name=record_filename.removesuffix(".lua"))
 
     @staticmethod
     def _key(provider: str, model: str) -> str:
@@ -118,6 +138,15 @@ class CircuitBreaker:
     @staticmethod
     def _window_key(provider: str, model: str) -> str:
         return f"circuit:{provider}:{model}:window"
+
+    @staticmethod
+    def _error_rate_window_key(provider: str, model: str) -> str:
+        # Deliberately a DIFFERENT key than _window_key -- see
+        # circuit_record_error_rate.lua's header: fixed_count mode stores
+        # a LIST there, error_rate mode stores a ZSET, and a deployment
+        # that switches CIRCUIT_BREAKER_MODE at runtime must never hit a
+        # Redis WRONGTYPE error against leftover data from the other mode.
+        return f"circuit:{provider}:{model}:er_window"
 
     def _update_gauge(self, provider: str, model: str, state: str) -> None:
         """Sole call path onto `gen_ai_circuit_breaker_state` -- both
@@ -176,10 +205,23 @@ class CircuitBreaker:
     async def _record(self, provider: str, model: str, *, outcome: int) -> None:
         now = self._clock()
         try:
-            prev_state, new_state = await self._record_script.eval(
-                keys=[self._key(provider, model), self._window_key(provider, model)],
-                args=[outcome, now, self._window_size, self._failure_threshold],
-            )
+            if self._mode == "error_rate":
+                prev_state, new_state = await self._record_script.eval(
+                    keys=[self._key(provider, model), self._error_rate_window_key(provider, model)],
+                    args=[
+                        outcome,
+                        now,
+                        self._error_rate_window_seconds,
+                        self._error_rate_threshold,
+                        uuid.uuid4().hex,
+                        self._error_rate_minimum_samples,
+                    ],
+                )
+            else:
+                prev_state, new_state = await self._record_script.eval(
+                    keys=[self._key(provider, model), self._window_key(provider, model)],
+                    args=[outcome, now, self._window_size, self._failure_threshold],
+                )
         except (redis_exceptions.ConnectionError, redis_exceptions.TimeoutError):
             logger.warning(
                 "redis unavailable while recording circuit outcome for %s:%s — outcome not recorded",
@@ -219,15 +261,26 @@ class CircuitBreaker:
         raw = await self._redis.hgetall(self._key(provider, model))
         state = raw.get("state", "closed")
         opened_at = float(raw["opened_at"]) if raw.get("opened_at") else None
-        window = await self._redis.lrange(self._window_key(provider, model), 0, -1)
-        failures_in_window = sum(1 for v in window if v == "1")
+
+        if self._mode == "error_rate":
+            now = self._clock()
+            window_key = self._error_rate_window_key(provider, model)
+            await self._redis.zremrangebyscore(window_key, 0, now - self._error_rate_window_seconds)
+            members = await self._redis.zrange(window_key, 0, -1)
+            failures_in_window = sum(1 for m in members if m.startswith("f:"))
+            window_size = len(members)
+        else:
+            window = await self._redis.lrange(self._window_key(provider, model), 0, -1)
+            failures_in_window = sum(1 for v in window if v == "1")
+            window_size = len(window)
+
         return CircuitStatus(
             provider=provider,
             model=model,
             state=state,
             opened_at=opened_at,
             failures_in_window=failures_in_window,
-            window_size=len(window),
+            window_size=window_size,
         )
 
     async def list_status(self, provider_models: list[tuple[str, str]]) -> list[CircuitStatus]:

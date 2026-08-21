@@ -14,6 +14,7 @@ what we think it should produce.
 
 from __future__ import annotations
 
+import pytest
 from opentelemetry.trace import SpanKind, StatusCode
 
 from tests.unit.conftest import DATA_SCIENCE_KEY, FakeAdapter
@@ -149,3 +150,89 @@ def test_root_server_span_carries_the_http_route_and_status(traced_client, span_
     assert not any(
         s.name.startswith(("GET /", "POST /")) and "http" in s.name for s in other_spans
     )
+
+
+# -- Phase 7: gen_ai.usage.cost_usd on the CLIENT span -----------------------
+#
+# Doc 1's own observability critique: cost was computed for budget/metrics
+# in app/api/v1_chat.py but never attached to the CLIENT span itself. See
+# app/resilience/fallback.py's `_cost_usd_or_none` and FallbackRouter's
+# `pricing_table` constructor param.
+
+
+def test_client_span_carries_cost_usd_when_a_pricing_entry_exists(
+    traced_client, span_exporter, monkeypatch
+):
+    from app.core.pricing import ModelPricing
+
+    fake = FakeAdapter(response_text="ok")
+    monkeypatch.setattr("app.api.v1_chat.resolve_model", lambda model_id: (fake, "gpt-5.4-served"))
+    # FakeAdapter.provider_name is always "fake" -- give it a real pricing
+    # row the same way test_metrics_exported.py's cost tests already do.
+    traced_client.app.state.pricing["fake:gpt-5.4-served"] = ModelPricing(
+        input_per_million=2.0, output_per_million=10.0
+    )
+
+    resp = traced_client.post(
+        "/v1/chat/completions",
+        json={"model": "openai:gpt-5.4", "messages": [{"role": "user", "content": "hi"}]},
+        headers={"X-Gateway-API-Key": DATA_SCIENCE_KEY},
+    )
+    assert resp.status_code == 200
+
+    spans = span_exporter.get_finished_spans()
+    client_span = _find(spans, "chat gpt-5.4-served")
+    # FakeAdapter's default usage is input_tokens=10, output_tokens=5
+    # (tests/unit/conftest.py) -> 10*2.0/1e6 + 5*10.0/1e6 = 0.00007
+    assert client_span.attributes["gen_ai.usage.cost_usd"] == pytest.approx(0.00007)
+
+
+def test_client_span_streaming_carries_cost_usd_on_the_terminal_usage_chunk(
+    traced_client, span_exporter, monkeypatch
+):
+    from app.core.pricing import ModelPricing
+
+    fake = FakeAdapter(stream_chunks=["Hel", "lo"])
+    monkeypatch.setattr("app.api.v1_chat.resolve_model", lambda model_id: (fake, "gpt-5.4-served"))
+    traced_client.app.state.pricing["fake:gpt-5.4-served"] = ModelPricing(
+        input_per_million=2.0, output_per_million=10.0
+    )
+
+    with traced_client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "openai:gpt-5.4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+        headers={"X-Gateway-API-Key": DATA_SCIENCE_KEY},
+    ) as resp:
+        assert resp.status_code == 200
+        resp.read()
+
+    spans = span_exporter.get_finished_spans()
+    client_span = _find(spans, "chat gpt-5.4-served")
+    # Streaming FakeAdapter's terminal usage is input_tokens=10,
+    # output_tokens=len(stream_chunks)=2 -> 10*2.0/1e6 + 2*10.0/1e6 = 0.00004
+    assert client_span.attributes["gen_ai.usage.cost_usd"] == pytest.approx(0.00004)
+
+
+def test_fallback_router_without_a_pricing_table_omits_cost_usd_not_crashes():
+    """Backward-compat guard: every FallbackRouter constructed directly in
+    the test suite before Phase 7 (e.g.
+    test_streaming_passthrough.py's `_redis_free_fallback_router()`) never
+    passes pricing_table -- `_cost_usd_or_none` must return None, not
+    raise, so those call sites keep working unmodified."""
+    from app.core.config import TiersConfig
+    from app.resilience.fallback import FallbackRouter
+    from app.resilience.retry import RetryPolicy
+    from app.resilience.stub import CircuitBreaker as AlwaysClosedCircuitBreaker
+
+    router = FallbackRouter(
+        circuit_breaker=AlwaysClosedCircuitBreaker(),
+        retry_policy=RetryPolicy(max_attempts=1),
+        tiers_config=TiersConfig(tiers={}),
+    )
+    assert router._cost_usd_or_none("fake", "served-model", object()) is None
+

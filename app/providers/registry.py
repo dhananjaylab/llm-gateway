@@ -93,6 +93,17 @@ def all_configured_provider_models(model_ids: list[str]) -> list[tuple[str, str,
     return out
 
 
+async def close_all_adapters() -> None:
+    """
+    Phase 7: release transport resources held by all cached adapters.
+    Called during app shutdown (see app/main.py's lifespan). A no-op if
+    no adapters were ever instantiated (cache is empty).
+    """
+    adapters = _adapters()
+    for adapter in adapters.values():
+        await adapter.aclose()
+
+
 def reset_registry_cache() -> None:
     """Test-only hook: clear the memoized adapter singletons."""
     # Also clear the provider settings cache so tests that manipulate

@@ -361,3 +361,73 @@ async def test_streaming_mid_stream_failure_does_not_fall_back(app, monkeypatch)
     assert "event: error" in raw_text
     assert "timeout" in raw_text
     assert never_reached.call_count == 0
+
+
+async def test_streaming_mid_stream_failure_still_bills_the_partial_content(app, monkeypatch, admin_headers):
+    """
+    Phase 7 regression guard for the financial-leakage gap the previous
+    test's scenario also exercises: before Phase 7,
+    `_stream_response`'s `except` branch reconciled the TPM reservation
+    against a blanket 0 and NEVER called `budget_enforcer.record_spend()`
+    — the "partial" content this exact test already proves reached the
+    client was never billed. See
+    docs/PHASE7_IMPLEMENTATION_GUIDE.md and
+    `_reconcile_and_bill_partial` in app/api/v1_chat.py.
+    """
+    from app.core.pricing import ModelPricing
+
+    class _FailsAfterFirstChunk(FakeAdapter):
+        async def stream(self, payload, *, request, provider_model):
+            self.call_count += 1
+            yield await self._first_chunk(provider_model)
+            raise ProviderError("connection dropped mid-stream", retryable=True, error_type="timeout")
+
+        async def _first_chunk(self, provider_model):
+            from app.core.schema import UnifiedStreamChunk
+
+            return UnifiedStreamChunk(
+                id="mid-stream-2", provider=self.provider_name, model_served=provider_model, delta="partial"
+            )
+
+    primary = _FailsAfterFirstChunk()
+
+    def _resolve(model_id: str):
+        if model_id == "openai:gpt-5.6-sol":
+            return primary, "gpt-5.6-sol-served"
+        raise AssertionError(f"mid-stream failure must not advance the chain to {model_id}")
+
+    monkeypatch.setattr("app.api.v1_chat.resolve_model", _resolve)
+
+    async with running_app_client(app) as client:
+        await _grant_tier(app, "tier-1-reasoning")
+        # A real, nonzero pricing entry -- without one, calculate_cost_usd
+        # would correctly return $0.00 and this test couldn't tell "billed
+        # $0.00 because nothing was recorded" apart from "billed $0.00
+        # because there's no price," which isn't what's under test here.
+        app.state.pricing["fake:gpt-5.6-sol-served"] = ModelPricing(
+            input_per_million=2.0, output_per_million=10.0
+        )
+
+        budget_before = await client.get(
+            "/admin/budgets/data-science", headers=admin_headers
+        )
+        spend_before = budget_before.json()["spend_usd"]
+
+        async with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json=_body("tier-1-reasoning", stream=True),
+            headers={"X-Gateway-API-Key": DATA_SCIENCE_KEY},
+        ) as resp:
+            assert resp.status_code == 200
+            await resp.aread()
+
+        budget_after = await client.get(
+            "/admin/budgets/data-science", headers=admin_headers
+        )
+        spend_after = budget_after.json()["spend_usd"]
+
+    assert spend_after > spend_before, (
+        "the partial content sent before the mid-stream failure must be billed -- "
+        f"spend was {spend_before} before and {spend_after} after, expected an increase"
+    )

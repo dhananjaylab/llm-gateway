@@ -37,10 +37,23 @@ class GeminiAdapter(ProviderAdapter):
         api_key: str,
         base_url: str = "https://generativelanguage.googleapis.com/v1beta",
         timeout_seconds: float = 30.0,
+        max_connections: int = 100,
+        max_keepalive_connections: int = 20,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout_seconds
+        # Phase 7 fix: ONE pooled client held for this adapter's lifetime —
+        # see docs/PHASE7_IMPLEMENTATION_GUIDE.md.
+        self._client = httpx.AsyncClient(
+            timeout=timeout_seconds,
+            limits=httpx.Limits(
+                max_connections=max_connections, max_keepalive_connections=max_keepalive_connections
+            ),
+        )
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
     def translate_request(self, request: UnifiedChatRequest, *, provider_model: str) -> dict:
         contents: list[dict] = []
@@ -82,8 +95,7 @@ class GeminiAdapter(ProviderAdapter):
         url = f"{self._base_url}/models/{model}:generateContent"
         headers = {"x-goog-api-key": self._api_key}
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.post(url, json=body, headers=headers)
+            resp = await self._client.post(url, json=body, headers=headers)
         except httpx.TimeoutException as exc:
             raise ProviderError("gemini request timed out", retryable=True, error_type="timeout") from exc
         except httpx.TransportError as exc:

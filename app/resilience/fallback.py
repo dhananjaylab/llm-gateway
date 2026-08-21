@@ -66,6 +66,7 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from app.core.pricing import PricingTable, calculate_cost_usd
 from app.core.schema import UnifiedChatRequest, UnifiedChatResponse, UnifiedStreamChunk
 from app.observability.metrics import GatewayMetrics
 from app.observability.tracing import (
@@ -139,6 +140,7 @@ class FallbackRouter:
         tracer=None,
         metrics: GatewayMetrics | None = None,
         capture_content: bool = False,
+        pricing_table: PricingTable | None = None,
     ) -> None:
         self._circuit_breaker = circuit_breaker
         self._retry_policy = retry_policy
@@ -155,6 +157,21 @@ class FallbackRouter:
         self._tracer = tracer
         self._metrics = metrics
         self._capture_content = capture_content
+        # Phase 7: optional, same "None means skip" default as tracer/
+        # metrics above -- attaches gen_ai.usage.cost_usd onto the CLIENT
+        # span (Doc 1's own observability critique: cost is computed for
+        # budget/metrics in app/api/v1_chat.py but was never attached to
+        # the span itself). Threaded in here, not computed in v1_chat.py
+        # and attached after the fact, for the exact reason
+        # `unified = adapter.translate_response(...)` already lives here
+        # (see this module's own docstring above): a span cannot be
+        # enriched after it closes, and by the time v1_chat.py sees a
+        # result, the span already has. app/main.py passes
+        # `app.state.pricing` (the same dict every other pricing lookup
+        # already reads); a bare `FallbackRouter(...)` in a test that
+        # doesn't pass this just doesn't get the attribute -- no existing
+        # test breaks.
+        self._pricing_table = pricing_table
 
     def resolve_chain(self, model_id: str) -> list[str]:
         """
@@ -194,6 +211,15 @@ class FallbackRouter:
             self._metrics.fallback_events_total.labels(
                 primary_provider=primary_provider, fallback_provider=fallback_provider
             ).inc()
+
+    def _cost_usd_or_none(self, provider: str, model_served: str, usage) -> float | None:
+        """Phase 7: the one place both execute_non_streaming and
+        stream_with_fallback compute gen_ai.usage.cost_usd for the CLIENT
+        span, so the `self._pricing_table is None` skip (no pricing_table
+        threaded in -- see __init__) lives in exactly one spot."""
+        if self._pricing_table is None:
+            return None
+        return calculate_cost_usd(self._pricing_table, provider, model_served, usage)
 
     # -- non-streaming ---------------------------------------------------------
 
@@ -310,7 +336,10 @@ class FallbackRouter:
                 unified = adapter.translate_response(
                     raw, request=enriched_request, provider_model=provider_model
                 )
-                set_span_success(span, response_model=unified.model_served, usage=unified.usage)
+                cost_usd = self._cost_usd_or_none(adapter.provider_name, unified.model_served, unified.usage)
+                set_span_success(
+                    span, response_model=unified.model_served, usage=unified.usage, cost_usd=cost_usd
+                )
                 maybe_capture_content(
                     span,
                     enabled=self._capture_content,
@@ -470,6 +499,18 @@ class FallbackRouter:
                         if chunk.usage is not None and span is not None:
                             span.set_attribute("gen_ai.usage.input_tokens", chunk.usage.input_tokens)
                             span.set_attribute("gen_ai.usage.output_tokens", chunk.usage.output_tokens)
+                            # Phase 7: cost is only knowable once the terminal
+                            # usage chunk arrives (same reasoning as the
+                            # non-streaming path's _cost_usd_or_none -- see
+                            # __init__'s pricing_table docstring), so it's
+                            # attached here incrementally rather than at the
+                            # set_span_success call above, which fires on the
+                            # *first* chunk, before usage exists at all.
+                            cost_usd = self._cost_usd_or_none(
+                                adapter.provider_name, chunk.model_served, chunk.usage
+                            )
+                            if cost_usd is not None:
+                                span.set_attribute("gen_ai.usage.cost_usd", cost_usd)
                         yield chunk
                 except ProviderError as exc:
                     # Mid-stream failure, content already sent to the client —

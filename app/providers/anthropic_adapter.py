@@ -50,10 +50,26 @@ class AnthropicAdapter(ProviderAdapter):
         api_key: str,
         base_url: str = "https://api.anthropic.com",
         timeout_seconds: float = 30.0,
+        max_connections: int = 100,
+        max_keepalive_connections: int = 20,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout_seconds
+        # Phase 7 fix: ONE pooled client held for this adapter's lifetime,
+        # not a fresh httpx.AsyncClient (and therefore a fresh TCP
+        # connection pool) constructed and torn down on every call()/
+        # stream() — see docs/PHASE7_IMPLEMENTATION_GUIDE.md for the
+        # "socket exhaustion at 5,000+ RPS" bottleneck this closes.
+        self._client = httpx.AsyncClient(
+            timeout=timeout_seconds,
+            limits=httpx.Limits(
+                max_connections=max_connections, max_keepalive_connections=max_keepalive_connections
+            ),
+        )
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
     def _headers(self) -> dict:
         return {
@@ -90,8 +106,7 @@ class AnthropicAdapter(ProviderAdapter):
     async def call(self, payload: dict) -> dict:
         url = f"{self._base_url}/v1/messages"
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.post(url, json=payload, headers=self._headers())
+            resp = await self._client.post(url, json=payload, headers=self._headers())
         except httpx.TimeoutException as exc:
             raise ProviderError(
                 "anthropic request timed out", retryable=True, error_type="timeout"
@@ -145,58 +160,57 @@ class AnthropicAdapter(ProviderAdapter):
         input_tokens = 0
 
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                async with client.stream(
-                    "POST", url, json=payload, headers=self._headers()
-                ) as resp:
-                    if resp.status_code >= 400:
-                        body = await resp.aread()
-                        _raise_for_status_bytes(resp.status_code, body)
+            async with self._client.stream(
+                "POST", url, json=payload, headers=self._headers()
+            ) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    _raise_for_status_bytes(resp.status_code, body)
 
-                    event_type = None
-                    async for line in resp.aiter_lines():
-                        if not line:
-                            continue
-                        if line.startswith("event:"):
-                            event_type = line[len("event:") :].strip()
-                            continue
-                        if not line.startswith("data:"):
-                            continue
+                event_type = None
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith("event:"):
+                        event_type = line[len("event:") :].strip()
+                        continue
+                    if not line.startswith("data:"):
+                        continue
 
-                        data = json.loads(line[len("data:") :].strip())
+                    data = json.loads(line[len("data:") :].strip())
 
-                        if event_type == "message_start":
-                            message = data.get("message", {})
-                            message_id = message.get("id", message_id)
-                            served_model = message.get("model", served_model)
-                            input_tokens = (message.get("usage") or {}).get("input_tokens", 0)
+                    if event_type == "message_start":
+                        message = data.get("message", {})
+                        message_id = message.get("id", message_id)
+                        served_model = message.get("model", served_model)
+                        input_tokens = (message.get("usage") or {}).get("input_tokens", 0)
 
-                        elif event_type == "content_block_delta":
-                            delta = data.get("delta", {})
-                            if delta.get("type") == "text_delta":
-                                yield UnifiedStreamChunk(
-                                    id=message_id or UnifiedChatResponse.new_id(),
-                                    provider=self.provider_name,
-                                    model_served=served_model,
-                                    delta=delta.get("text", ""),
-                                )
-
-                        elif event_type == "message_delta":
-                            stop_reason = (data.get("delta") or {}).get("stop_reason")
-                            output_tokens = (data.get("usage") or {}).get("output_tokens", 0)
+                    elif event_type == "content_block_delta":
+                        delta = data.get("delta", {})
+                        if delta.get("type") == "text_delta":
                             yield UnifiedStreamChunk(
                                 id=message_id or UnifiedChatResponse.new_id(),
                                 provider=self.provider_name,
                                 model_served=served_model,
-                                delta="",
-                                finish_reason=_map_stop_reason(stop_reason),
-                                usage=Usage(
-                                    input_tokens=input_tokens, output_tokens=output_tokens
-                                ),
+                                delta=delta.get("text", ""),
                             )
 
-                        elif event_type == "message_stop":
-                            break
+                    elif event_type == "message_delta":
+                        stop_reason = (data.get("delta") or {}).get("stop_reason")
+                        output_tokens = (data.get("usage") or {}).get("output_tokens", 0)
+                        yield UnifiedStreamChunk(
+                            id=message_id or UnifiedChatResponse.new_id(),
+                            provider=self.provider_name,
+                            model_served=served_model,
+                            delta="",
+                            finish_reason=_map_stop_reason(stop_reason),
+                            usage=Usage(
+                                input_tokens=input_tokens, output_tokens=output_tokens
+                            ),
+                        )
+
+                    elif event_type == "message_stop":
+                        break
         except httpx.TimeoutException as exc:
             raise ProviderError(
                 "anthropic stream timed out", retryable=True, error_type="timeout"

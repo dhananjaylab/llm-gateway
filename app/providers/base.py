@@ -76,3 +76,25 @@ class ProviderAdapter(ABC):
         from upstream — implementations must not buffer the full response
         before yielding the first chunk (this is what keeps TTFT low).
         """
+
+    async def aclose(self) -> None:
+        """
+        Phase 7: release whatever transport resources this adapter holds
+        (a real adapter's shared, pooled httpx.AsyncClient — see each
+        adapter's __init__ and docs/PHASE7_IMPLEMENTATION_GUIDE.md for the
+        bug this replaces: constructing a brand-new httpx.AsyncClient,
+        and therefore a brand-new TCP connection pool, on every single
+        call()/stream() invocation instead of once per adapter).
+
+        Deliberately NOT abstract: this is a new lifecycle hook layered on
+        an interface three phases of tests already construct directly —
+        FakeAdapter (tests/unit/conftest.py) holds no real transport and
+        has nothing to release. A no-op default here means no existing
+        subclass or test needs to change just to keep working. The four
+        real adapters (openai_adapter.py, anthropic_adapter.py,
+        ollama_adapter.py, gemini_adapter.py) each override this to close
+        their one shared client; app/providers/registry.py's
+        close_all_adapters() calls it on every cached adapter during
+        app/main.py's lifespan shutdown.
+        """
+        return None

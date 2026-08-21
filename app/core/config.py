@@ -102,14 +102,33 @@ def reset_config_cache() -> None:
 
 
 class ProviderSettings(BaseModel):
+    # Phase 7 ("search first" pass, Aug 2026): max_connections /
+    # max_keepalive_connections size the shared httpx.AsyncClient each
+    # adapter now builds ONCE at construction time (app/providers/base.py
+    # / registry.py) instead of a fresh client per call -- see
+    # docs/PHASE7_IMPLEMENTATION_GUIDE.md for the bug this replaces
+    # ("socket exhaustion (TIME_WAIT) at 5,000+ RPS" from constructing a
+    # brand-new TCP connection pool on every single provider call).
+    # Per-provider, not one shared pair, matching this class's existing
+    # per-provider api_key/base_url pattern -- Ollama's default is smaller
+    # since it's typically a single local instance, not a horizontally
+    # scaled hosted API.
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com"
+    openai_max_connections: int = 100
+    openai_max_keepalive_connections: int = 20
     anthropic_api_key: str | None = None
     anthropic_base_url: str = "https://api.anthropic.com"
+    anthropic_max_connections: int = 100
+    anthropic_max_keepalive_connections: int = 20
     gemini_api_key: str | None = None
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    gemini_max_connections: int = 100
+    gemini_max_keepalive_connections: int = 20
     ollama_base_url: str = "http://localhost:11434"
     ollama_api_key: str | None = None
+    ollama_max_connections: int = 50
+    ollama_max_keepalive_connections: int = 10
 
 
 @lru_cache(maxsize=1)
@@ -117,12 +136,22 @@ def get_provider_settings() -> ProviderSettings:
     return ProviderSettings(
         openai_api_key=os.environ.get("OPENAI_API_KEY"),
         openai_base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com"),
+        openai_max_connections=int(os.environ.get("OPENAI_MAX_CONNECTIONS", "100")),
+        openai_max_keepalive_connections=int(os.environ.get("OPENAI_MAX_KEEPALIVE_CONNECTIONS", "20")),
         anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY"),
         anthropic_base_url=os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+        anthropic_max_connections=int(os.environ.get("ANTHROPIC_MAX_CONNECTIONS", "100")),
+        anthropic_max_keepalive_connections=int(
+            os.environ.get("ANTHROPIC_MAX_KEEPALIVE_CONNECTIONS", "20")
+        ),
         gemini_api_key=os.environ.get("GEMINI_API_KEY"),
         gemini_base_url=os.environ.get("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"),
+        gemini_max_connections=int(os.environ.get("GEMINI_MAX_CONNECTIONS", "100")),
+        gemini_max_keepalive_connections=int(os.environ.get("GEMINI_MAX_KEEPALIVE_CONNECTIONS", "20")),
         ollama_base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
         ollama_api_key=os.environ.get("OLLAMA_API_KEY"),
+        ollama_max_connections=int(os.environ.get("OLLAMA_MAX_CONNECTIONS", "50")),
+        ollama_max_keepalive_connections=int(os.environ.get("OLLAMA_MAX_KEEPALIVE_CONNECTIONS", "10")),
     )
 
 
@@ -224,6 +253,23 @@ class GatewaySettings(BaseModel):
     circuit_breaker_window_size: int = 10
     circuit_breaker_cooldown_seconds: float = 60.0
 
+    # Phase 7: the v2 extension the TRD's own Appendix A anticipated
+    # ("move to a rolling error-rate percentage only if the fixed
+    # threshold proves too twitchy"). "error_rate" mode reuses the exact
+    # sorted-set rolling-window pattern app/resilience/health.py already
+    # established (score=timestamp, ZREMRANGEBYSCORE trims to the last N
+    # seconds) instead of circuit_record.lua's fixed-size LIST -- a
+    # request-count window and a time window answer different questions
+    # ("last 10 calls" vs "last 30 seconds", which differ a lot under
+    # bursty or sparse traffic) and Doc 1's own critique was specifically
+    # about the time-window case. Default mode is unchanged
+    # ("fixed_count") so switching this on is opt-in, not a behavior
+    # change for anyone who doesn't touch it.
+    circuit_breaker_mode: str = "fixed_count"  # "fixed_count" | "error_rate"
+    circuit_breaker_error_rate_window_seconds: float = 30.0
+    circuit_breaker_error_rate_threshold: float = 0.5  # matches fixed_count's default 5-in-10 = 50%
+    circuit_breaker_error_rate_minimum_samples: int = 5
+
     # -- Phase 3: retry with backoff ----------------------------------------
     # TRD: "retry the primary with exponential backoff (up to 3 retries)".
     # base/max delay bound the AWS-style "full jitter" formula in
@@ -310,6 +356,16 @@ def get_gateway_settings() -> GatewaySettings:
         circuit_breaker_window_size=int(os.environ.get("CIRCUIT_BREAKER_WINDOW_SIZE", "10")),
         circuit_breaker_cooldown_seconds=float(
             os.environ.get("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "60.0")
+        ),
+        circuit_breaker_mode=os.environ.get("CIRCUIT_BREAKER_MODE", "fixed_count"),
+        circuit_breaker_error_rate_window_seconds=float(
+            os.environ.get("CIRCUIT_BREAKER_ERROR_RATE_WINDOW_SECONDS", "30.0")
+        ),
+        circuit_breaker_error_rate_threshold=float(
+            os.environ.get("CIRCUIT_BREAKER_ERROR_RATE_THRESHOLD", "0.5")
+        ),
+        circuit_breaker_error_rate_minimum_samples=int(
+            os.environ.get("CIRCUIT_BREAKER_ERROR_RATE_MINIMUM_SAMPLES", "5")
         ),
         retry_max_attempts=int(os.environ.get("RETRY_MAX_ATTEMPTS", "3")),
         retry_base_delay_seconds=float(os.environ.get("RETRY_BASE_DELAY_SECONDS", "0.2")),

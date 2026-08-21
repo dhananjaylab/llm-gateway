@@ -31,15 +31,14 @@ The compose file already sets `OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318/v1
 
 ---
 
-## Option 2: Local Development (Without Docker)
+## Option 2: Local Development (Recommended for Iteration)
 
-**Best for:** Faster iteration, running just the gateway locally
+**Best for:** Faster development iteration with full observability stack (Jaeger + Prometheus + Grafana)
 
-### Setup
+### Setup — Start Backend Services
 
-#### 1. Start Jaeger locally
+#### 1. Start Jaeger (traces)
 ```bash
-# If you have Docker but don't want full compose:
 docker run -d \
   --name jaeger-local \
   -p 16686:16686 \
@@ -49,24 +48,63 @@ docker run -d \
   --config /etc/jaeger/config.yaml
 ```
 
-Or download [Jaeger binary](https://www.jaegertracing.io/download/) for Windows:
+Verify: http://localhost:16686 (you should see the Jaeger UI)
+
+#### 2. Start Prometheus (metrics)
 ```bash
-jaeger --config=deploy/jaeger/config.yaml
+docker run -d \
+  --name prometheus-local \
+  -p 9090:9090 \
+  -v C:\llm-gateway\deploy\prometheus\prometheus.yml:/etc/prometheus/prometheus.yml:ro \
+  -v C:\llm-gateway\deploy\prometheus\alerts.yml:/etc/prometheus/alerts.yml:ro \
+  prom/prometheus:v3.13.2 \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --web.enable-lifecycle
 ```
 
-#### 2. Start Redis
+Verify: http://localhost:9090 (Prometheus should be scraping `localhost:8000/metrics`)
+
+#### 3. Start Grafana (dashboards)
 ```bash
-# If using local Redis
-docker run -d -p 6379:6379 redis:8-alpine
-# OR use your RedisLabs URL (already in .env)
+docker run -d \
+  --name grafana-local \
+  -p 3000:3000 \
+  -e GF_SECURITY_ADMIN_USER=admin \
+  -e GF_SECURITY_ADMIN_PASSWORD=admin \
+  -v C:\llm-gateway\deploy\grafana\provisioning:/etc/grafana/provisioning:ro \
+  -v C:\llm-gateway\deploy\grafana\dashboards:/var/lib/grafana/dashboards:ro \
+  grafana/grafana:13.1.3
 ```
 
-#### 3. Set tracing endpoint in .env
+Verify: http://localhost:3000 (login with admin/admin)
+
+#### 4. Start Redis
+```bash
+# Option A: Local container
+docker run -d \
+  --name redis-local \
+  -p 6379:6379 \
+  redis:8-alpine
+
+# Option B: Use your RedisLabs URL (already in .env)
+# Just leave REDIS_URL as-is, no action needed
+```
+
+### Setup — Update .env and Start Gateway
+
+#### 5. Update `.env` for local backends
 ```env
+# Tracing endpoint
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318/v1/traces
+
+# If using local Redis (Option A above):
+REDIS_URL=redis://localhost:6379/0
+
+# If using RedisLabs (Option B):
+# Leave REDIS_URL unchanged (already in .env)
 ```
 
-#### 4. Start the gateway
+#### 6. Start the gateway
 ```bash
 python -m venv .venv
 .venv\Scripts\activate
@@ -75,9 +113,16 @@ uvicorn app.main:app --reload --port 8000
 ```
 
 ### What to expect:
-- Spans exported to Jaeger on every request
-- View traces at http://localhost:16686
-- No metrics/dashboards (Prometheus separate if needed)
+- **Jaeger UI**: http://localhost:16686 → Traces appear on every request
+- **Prometheus**: http://localhost:9090 → Metrics at `gateway:8000:8000`
+- **Grafana**: http://localhost:3000 → Pre-provisioned dashboards (operations, business, performance)
+- **Gateway**: http://localhost:8000 → Your app, hot-reload enabled
+
+### Cleanup (stop all local services)
+```bash
+docker stop jaeger-local prometheus-local grafana-local redis-local
+docker rm jaeger-local prometheus-local grafana-local redis-local
+```
 
 ---
 
@@ -125,8 +170,8 @@ uvicorn app.main:app --reload --port 8000
 
 | Option | Jaeger | Prometheus | Grafana | Setup Time | Cost | Use Case |
 |--------|--------|------------|---------|-----------|------|----------|
-| **Docker Compose** | ✓ | ✓ | ✓ | 30s | Free (mock only) | Full demo, review |
-| **Local Dev** | ✓ | ✗ | ✗ | 2-3 min | Free | Tracing focused |
+| **Local Dev (Option 2)** | ✓ | ✓ | ✓ | 5-10 min | Free | **Recommended** — full stack, hot-reload |
+| **Docker Compose** | ✓ | ✓ | ✓ | 30s | Free (mock only) | Demo, review, zero config |
 | **Collectors Only** | ✗ | ✓ | ✓ | 15s | Free | Metrics focused |
 | **None** | ✗ | ✗ | ✗ | 5s | Free | Quick testing |
 
@@ -134,13 +179,30 @@ uvicorn app.main:app --reload --port 8000
 
 ## Testing the Setup
 
-### Option 1/2 (with Jaeger):
+### Option 2 (Local Dev with full stack):
 ```bash
+# Make a request to the gateway
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "X-Gateway-API-Key: sk-gw-datascience-demo-001" \
   -d '{
     "model": "openai:gpt-5.6-sol",
+    "messages": [{"role": "user", "content": "Say hi"}]
+  }'
+
+# Check results:
+# - Jaeger traces: http://localhost:16686 (search for service "llm-gateway")
+# - Prometheus metrics: http://localhost:9090 (query: gen_ai_requests_total)
+# - Grafana dashboards: http://localhost:3000 (operations/business/performance tabs)
+```
+
+### Option 1 (Docker Compose):
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-Gateway-API-Key: sk-gw-datascience-demo-001" \
+  -d '{
+    "model": "tier-1-reasoning",
     "messages": [{"role": "user", "content": "Say hi"}]
   }'
 
@@ -205,13 +267,33 @@ OTEL_EXPORTER_OTLP_ENDPOINT (HTTP)
 
 ## Next Steps
 
-1. **Pick your option** based on use case above
-2. **Start the services** (docker compose or individual tools)
-3. **Update `.env`** with the `OTEL_EXPORTER_OTLP_ENDPOINT` 
-4. **Restart the gateway** (if already running)
-5. **Make a request** and check Jaeger at `http://localhost:16686`
+### For Option 2 (Recommended):
+1. Copy the 4 `docker run` commands for Jaeger, Prometheus, Grafana, Redis
+2. Run them in sequence (copy-paste into terminal)
+3. Update `.env` with `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318/v1/traces`
+4. Start the gateway: `uvicorn app.main:app --reload --port 8000`
+5. Make a test request (curl example above)
+6. View results across all three observability tools
+
+### For Option 1 (Docker Compose):
+1. Run `docker compose up -d`
+2. Run `./scripts/verify_stack_healthy.sh`
+3. Check `docker compose logs -f demo-seed` for demo team keys
+4. Make a test request
+
+### Stopping all services:
+```bash
+# Option 2 local containers
+docker stop jaeger-local prometheus-local grafana-local redis-local
+docker rm jaeger-local prometheus-local grafana-local redis-local
+
+# Option 1 compose stack
+docker compose down
+```
 
 For full details, see:
 - `README.md` "Run it" section (docker-compose full walkthrough)
 - `deploy/jaeger/config.yaml` (Jaeger v2 configuration)
+- `deploy/prometheus/prometheus.yml` (metric scraping config)
+- `deploy/grafana/provisioning/` (dashboard provisioning)
 - `app/observability/tracing.py` (span creation logic)

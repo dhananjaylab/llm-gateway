@@ -76,7 +76,8 @@ from app.observability.tracing import internal_span
 from app.providers.base import ProviderError
 from app.providers.registry import UnknownProviderError, resolve_model
 from app.ratelimit.budget import BudgetUnavailableError
-from app.ratelimit.estimator import estimate_reserved_tokens
+from app.ratelimit.estimator import estimate_input_tokens, estimate_reserved_tokens
+from app.ratelimit.output_tokenizer import count_partial_output_tokens
 from app.resilience.fallback import FallbackExhaustedError
 
 logger = logging.getLogger("gateway.v1_chat")
@@ -100,6 +101,28 @@ def _fallback_exhausted_response(exc: FallbackExhaustedError) -> dict:
     }
 
 
+def _budget_exceeded_exception(team: TeamConfig, budget_decision) -> HTTPException:
+    """Shared by both the batch-priority and combined-quota-check paths in
+    chat_completions below (Phase 7 split these into two call sequences —
+    see app/ratelimit/combined.py's module docstring on why) so the 402
+    body's exact shape can't silently drift between the two."""
+    return HTTPException(
+        status_code=status.HTTP_402_PAYMENT_REQUIRED,
+        detail={
+            "error": {
+                "type": "budget_exceeded",
+                "message": (
+                    f"Team '{team.team_id}' has reached its {team.budget_period} "
+                    f"budget cap for {budget_decision.period}."
+                ),
+                "spend_usd": budget_decision.spend_usd,
+                "cap_usd": budget_decision.cap_usd,
+                "period": budget_decision.period,
+            }
+        },
+    )
+
+
 @router.post(
     "/v1/chat/completions",
     response_model=None,
@@ -117,6 +140,7 @@ async def chat_completions(
     rate_limiter = app_state.rate_limiter
     budget_enforcer = app_state.budget_enforcer
     batch_queue = app_state.batch_queue
+    combined_quota_checker = app_state.combined_quota_checker
     pricing_table = app_state.pricing
     fallback_router = app_state.fallback_router
 
@@ -136,51 +160,65 @@ async def chat_completions(
         ):
             enforce_model_allowed(team, request.model)
 
-            # -- stage 4a: budget precheck (fail-closed; read-only, so a
-            # rejection here never needs to roll anything back) ------------
-            try:
-                budget_decision = await budget_enforcer.precheck(team)
-            except BudgetUnavailableError as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail={
-                        "error": {
-                            "type": "budget_check_unavailable",
-                            "message": "Budget ledger is temporarily unavailable; failing closed.",
-                        }
-                    },
-                ) from exc
-
-            if not budget_decision.allowed:
-                if metrics is not None:
-                    metrics.budget_applied_total.labels(team_id=team.team_id).inc()
-                raise HTTPException(
-                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                    detail={
-                        "error": {
-                            "type": "budget_exceeded",
-                            "message": (
-                                f"Team '{team.team_id}' has reached its {team.budget_period} "
-                                f"budget cap for {budget_decision.period}."
-                            ),
-                            "spend_usd": budget_decision.spend_usd,
-                            "cap_usd": budget_decision.cap_usd,
-                            "period": budget_decision.period,
-                        }
-                    },
-                )
-
-            # -- stage 4b: rate limit check (or batch queueing) -------------
+            # -- stage 4a+4b: budget + rate limit -----------------------------
             estimated_tokens = estimate_reserved_tokens(request)
 
             if request.priority == "batch":
+                # Batch priority keeps its own separate budget precheck +
+                # queueing loop (app/ratelimit/priority_queue.py) rather than
+                # the Phase 7 combined round trip below -- that loop already
+                # retries the rate-limit check itself over up to
+                # BATCH_QUEUE_MAX_WAIT_SECONDS, which a single combined
+                # Redis call isn't shaped for. See
+                # app/ratelimit/combined.py's module docstring.
+                try:
+                    budget_decision = await budget_enforcer.precheck(team)
+                except BudgetUnavailableError as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail={
+                            "error": {
+                                "type": "budget_check_unavailable",
+                                "message": "Budget ledger is temporarily unavailable; failing closed.",
+                            }
+                        },
+                    ) from exc
+
+                if not budget_decision.allowed:
+                    if metrics is not None:
+                        metrics.budget_applied_total.labels(team_id=team.team_id).inc()
+                    raise _budget_exceeded_exception(team, budget_decision)
+
                 rl_decision = await batch_queue.run_with_queueing(
                     team=team, estimated_tokens=estimated_tokens, limiter=rate_limiter
                 )
             else:
-                rl_decision = await rate_limiter.check(
-                    team=team, estimated_tokens=estimated_tokens, priority=request.priority
-                )
+                # Phase 7: budget precheck + RPM/TPM check in ONE Redis round
+                # trip on the healthy-Redis fast path (falls back to the
+                # exact two original separate calls on a Redis outage,
+                # preserving budget's fail-closed / rate-limit's fail-open
+                # postures independently -- see combined.py).
+                try:
+                    combined = await combined_quota_checker.check(
+                        team=team, estimated_tokens=estimated_tokens
+                    )
+                except BudgetUnavailableError as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail={
+                            "error": {
+                                "type": "budget_check_unavailable",
+                                "message": "Budget ledger is temporarily unavailable; failing closed.",
+                            }
+                        },
+                    ) from exc
+
+                if combined.budget_denied:
+                    if metrics is not None:
+                        metrics.budget_applied_total.labels(team_id=team.team_id).inc()
+                    raise _budget_exceeded_exception(team, combined.budget)
+
+                rl_decision = combined.rate_limit
 
             if not rl_decision.allowed:
                 if metrics is not None:
@@ -314,6 +352,82 @@ async def chat_completions(
         raise
 
 
+async def _reconcile_and_bill_partial(
+    *,
+    team: TeamConfig,
+    reserved_tokens: int,
+    accumulated_text: str,
+    final_usage: Usage | None,
+    final_provider: str | None,
+    final_model_served: str | None,
+    tier_or_model: str,
+    request: UnifiedChatRequest,
+    rate_limiter,
+    budget_enforcer,
+    pricing_table,
+    metrics,
+) -> Usage | None:
+    """
+    Phase 7: shared by both `_stream_response`'s mid-stream-failure
+    (`except`) and normal-completion (`else`) branches. Before this
+    helper existed, "no terminal usage chunk ever arrived" — a client
+    disconnect, or a provider failure after content had already reached
+    the client — meant a blanket full TPM refund and
+    `budget_enforcer.record_spend()` was never called at all: tokens the
+    client actually received were never billed. See
+    docs/PHASE7_IMPLEMENTATION_GUIDE.md ("Advanced Token Accounting for
+    Cancelled and Aborted Streams").
+
+    If the terminal usage chunk DID arrive, this is a byte-for-byte
+    pass-through of the pre-Phase-7 behavior (uses `final_usage` exactly
+    as before — nothing below changes for the common, uninterrupted case).
+
+    Only when it's missing AND real content was generated
+    (`final_provider is not None and accumulated_text` is truthy) does
+    this compute a best-effort `Usage` from what's actually known: the
+    same pre-flight input-token estimate already used to size the
+    reservation (`app/ratelimit/estimator.py::estimate_input_tokens`,
+    recomputed here rather than threaded through as an extra parameter —
+    cheap, and keeps every existing call site's signature stable), and
+    the partial output text via
+    `app/ratelimit/output_tokenizer.py::count_partial_output_tokens`
+    (tiktoken for OpenAI, Google's local tokenizer for Gemini, Anthropic's
+    own documented heuristic for Anthropic, the project's existing
+    heuristic for anything else).
+
+    Returns the `Usage` actually used for accounting (so the caller can
+    still record per-token-type Prometheus metrics), or `None` if there
+    was truly nothing to bill.
+    """
+    if final_usage is not None:
+        usage: Usage | None = final_usage
+    elif final_provider is not None and accumulated_text:
+        output_tokens = count_partial_output_tokens(
+            final_provider, final_model_served or "", accumulated_text
+        )
+        usage = Usage(input_tokens=estimate_input_tokens(request), output_tokens=output_tokens)
+    else:
+        usage = None
+
+    actual_tokens = usage.total_tokens if usage is not None else 0
+    await rate_limiter.reconcile(team=team, reserved_tokens=reserved_tokens, actual_tokens=actual_tokens)
+
+    if usage is not None and final_provider is not None:
+        model_label = final_model_served or tier_or_model
+        cost_usd = calculate_cost_usd(pricing_table, final_provider, model_label, usage)
+        await budget_enforcer.record_spend(team, cost_usd)
+        record_token_usage_and_cost(
+            metrics,
+            team_id=team.team_id,
+            provider=final_provider,
+            model=model_label,
+            usage=usage,
+            cost_usd=cost_usd,
+        )
+
+    return usage
+
+
 async def _stream_response(
     *,
     fallback_router,
@@ -354,12 +468,20 @@ async def _stream_response(
     `request_duration_seconds` for the SSE-level failure case, so a
     dashboard can distinguish a genuinely failed streaming request from a
     successful one without both collapsing into a misleading "200".
+
+    Phase 7: `accumulated_text` is what makes
+    `_reconcile_and_bill_partial` (above) possible — every delta actually
+    forwarded to the client is appended to it, so if the stream is cut
+    short (disconnect or mid-stream provider failure), there's a
+    best-effort record of exactly what the client received to estimate
+    output tokens from, instead of the old "assume zero" behavior.
     """
     start = time.perf_counter()
     first_chunk_logged = False
     final_usage: Usage | None = None
     final_provider = None
     final_model_served = None
+    accumulated_text = ""
 
     agen = fallback_router.stream_with_fallback(
         chain=chain,
@@ -398,11 +520,25 @@ async def _stream_response(
             final_model_served = chunk.model_served
             if chunk.usage is not None:
                 final_usage = chunk.usage
+            if chunk.delta:
+                accumulated_text += chunk.delta
 
             yield f"data: {chunk.model_dump_json()}\n\n"
     except (ProviderError, FallbackExhaustedError) as exc:
-        actual_tokens = final_usage.total_tokens if final_usage else 0
-        await rate_limiter.reconcile(team=team, reserved_tokens=reserved_tokens, actual_tokens=actual_tokens)
+        await _reconcile_and_bill_partial(
+            team=team,
+            reserved_tokens=reserved_tokens,
+            accumulated_text=accumulated_text,
+            final_usage=final_usage,
+            final_provider=final_provider,
+            final_model_served=final_model_served,
+            tier_or_model=tier_or_model,
+            request=request,
+            rate_limiter=rate_limiter,
+            budget_enforcer=budget_enforcer,
+            pricing_table=pricing_table,
+            metrics=metrics,
+        )
         if metrics is not None:
             duration_s = time.perf_counter() - start
             metrics.requests_total.labels(
@@ -422,23 +558,20 @@ async def _stream_response(
             yield f"event: error\ndata: {json.dumps(_provider_error_response(exc))}\n\n"
         return
     else:
-        actual_tokens = final_usage.total_tokens if final_usage else 0
-        await rate_limiter.reconcile(
-            team=team, reserved_tokens=reserved_tokens, actual_tokens=actual_tokens
+        await _reconcile_and_bill_partial(
+            team=team,
+            reserved_tokens=reserved_tokens,
+            accumulated_text=accumulated_text,
+            final_usage=final_usage,
+            final_provider=final_provider,
+            final_model_served=final_model_served,
+            tier_or_model=tier_or_model,
+            request=request,
+            rate_limiter=rate_limiter,
+            budget_enforcer=budget_enforcer,
+            pricing_table=pricing_table,
+            metrics=metrics,
         )
-        if final_usage is not None and final_provider is not None:
-            cost_usd = calculate_cost_usd(
-                pricing_table, final_provider, final_model_served, final_usage
-            )
-            await budget_enforcer.record_spend(team, cost_usd)
-            record_token_usage_and_cost(
-                metrics,
-                team_id=team.team_id,
-                provider=final_provider,
-                model=final_model_served,
-                usage=final_usage,
-                cost_usd=cost_usd,
-            )
         if metrics is not None:
             duration_s = time.perf_counter() - start
             metrics.requests_total.labels(

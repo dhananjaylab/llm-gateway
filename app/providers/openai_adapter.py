@@ -76,10 +76,23 @@ class OpenAIAdapter(ProviderAdapter):
         api_key: str,
         base_url: str = "https://api.openai.com",
         timeout_seconds: float = 30.0,
+        max_connections: int = 100,
+        max_keepalive_connections: int = 20,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout_seconds
+        # Phase 7 fix: ONE pooled client held for this adapter's lifetime —
+        # see docs/PHASE7_IMPLEMENTATION_GUIDE.md.
+        self._client = httpx.AsyncClient(
+            timeout=timeout_seconds,
+            limits=httpx.Limits(
+                max_connections=max_connections, max_keepalive_connections=max_keepalive_connections
+            ),
+        )
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
     # -- request translation -------------------------------------------------
 
@@ -120,8 +133,7 @@ class OpenAIAdapter(ProviderAdapter):
         url = f"{self._base_url}/v1/responses"
         headers = {"Authorization": f"Bearer {self._api_key}"}
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.post(url, json=payload, headers=headers)
+            resp = await self._client.post(url, json=payload, headers=headers)
         except httpx.TimeoutException as exc:
             raise ProviderError(
                 "openai request timed out", retryable=True, error_type="timeout"
@@ -197,77 +209,76 @@ class OpenAIAdapter(ProviderAdapter):
         chunk_id = f"gw-{uuid.uuid4().hex[:24]}"
 
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                async with client.stream("POST", url, json=payload, headers=headers) as resp:
-                    if resp.status_code >= 400:
-                        body = await resp.aread()
-                        _raise_for_status_bytes(resp.status_code, body)
+            async with self._client.stream("POST", url, json=payload, headers=headers) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    _raise_for_status_bytes(resp.status_code, body)
 
-                    event_name: str | None = None
-                    data_lines: list[str] = []
+                event_name: str | None = None
+                data_lines: list[str] = []
 
-                    async for line in resp.aiter_lines():
-                        if line.startswith("event:"):
-                            event_name = line[len("event:"):].strip()
-                        elif line.startswith("data:"):
-                            data_lines.append(line[len("data:"):].strip())
-                        elif line == "":
-                            # Blank line: end of SSE block — dispatch if we have data.
-                            if event_name is not None and data_lines:
-                                raw_data = "".join(data_lines)
-                                try:
-                                    event_data = json.loads(raw_data)
-                                except json.JSONDecodeError:
-                                    event_name = None
-                                    data_lines = []
-                                    continue
+                async for line in resp.aiter_lines():
+                    if line.startswith("event:"):
+                        event_name = line[len("event:"):].strip()
+                    elif line.startswith("data:"):
+                        data_lines.append(line[len("data:"):].strip())
+                    elif line == "":
+                        # Blank line: end of SSE block — dispatch if we have data.
+                        if event_name is not None and data_lines:
+                            raw_data = "".join(data_lines)
+                            try:
+                                event_data = json.loads(raw_data)
+                            except json.JSONDecodeError:
+                                event_name = None
+                                data_lines = []
+                                continue
 
-                                if event_name == "response.output_text.delta":
-                                    yield UnifiedStreamChunk(
-                                        id=chunk_id,
-                                        provider=self.provider_name,
-                                        model_served=provider_model,
-                                        delta=event_data.get("delta", ""),
-                                    )
+                            if event_name == "response.output_text.delta":
+                                yield UnifiedStreamChunk(
+                                    id=chunk_id,
+                                    provider=self.provider_name,
+                                    model_served=provider_model,
+                                    delta=event_data.get("delta", ""),
+                                )
 
-                                elif event_name == "response.completed":
-                                    response_obj = event_data.get("response") or {}
-                                    usage_raw = response_obj.get("usage") or {}
-                                    input_tokens_details = (
-                                        usage_raw.get("input_tokens_details") or {}
-                                    )
-                                    served_model = response_obj.get("model", provider_model)
-                                    yield UnifiedStreamChunk(
-                                        id=chunk_id,
-                                        provider=self.provider_name,
-                                        model_served=served_model,
-                                        delta="",
-                                        finish_reason="stop",
-                                        usage=Usage(
-                                            input_tokens=usage_raw.get("input_tokens", 0),
-                                            output_tokens=usage_raw.get("output_tokens", 0),
-                                            cache_read_input_tokens=input_tokens_details.get(
-                                                "cached_tokens", 0
-                                            ),
+                            elif event_name == "response.completed":
+                                response_obj = event_data.get("response") or {}
+                                usage_raw = response_obj.get("usage") or {}
+                                input_tokens_details = (
+                                    usage_raw.get("input_tokens_details") or {}
+                                )
+                                served_model = response_obj.get("model", provider_model)
+                                yield UnifiedStreamChunk(
+                                    id=chunk_id,
+                                    provider=self.provider_name,
+                                    model_served=served_model,
+                                    delta="",
+                                    finish_reason="stop",
+                                    usage=Usage(
+                                        input_tokens=usage_raw.get("input_tokens", 0),
+                                        output_tokens=usage_raw.get("output_tokens", 0),
+                                        cache_read_input_tokens=input_tokens_details.get(
+                                            "cached_tokens", 0
                                         ),
-                                    )
+                                    ),
+                                )
 
-                                elif event_name == "error":
-                                    message = event_data.get("message", str(event_data))
-                                    code = event_data.get("code")
-                                    status_code = int(code) if code and str(code).isdigit() else None
-                                    retryable = status_code in _RETRYABLE_STATUS if status_code else False
-                                    raise ProviderError(
-                                        f"openai stream error: {message}",
-                                        status_code=status_code,
-                                        retryable=retryable,
-                                        error_type="openai_error",
-                                    )
+                            elif event_name == "error":
+                                message = event_data.get("message", str(event_data))
+                                code = event_data.get("code")
+                                status_code = int(code) if code and str(code).isdigit() else None
+                                retryable = status_code in _RETRYABLE_STATUS if status_code else False
+                                raise ProviderError(
+                                    f"openai stream error: {message}",
+                                    status_code=status_code,
+                                    retryable=retryable,
+                                    error_type="openai_error",
+                                )
 
-                                # Unknown events (response.created, rate_limits, etc.) are skipped.
+                            # Unknown events (response.created, rate_limits, etc.) are skipped.
 
-                            event_name = None
-                            data_lines = []
+                        event_name = None
+                        data_lines = []
 
         except httpx.TimeoutException as exc:
             raise ProviderError(

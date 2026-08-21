@@ -47,6 +47,8 @@ class OllamaAdapter(ProviderAdapter):
         base_url: str = "http://localhost:11434",
         api_key: str | None = None,
         timeout_seconds: float = 60.0,
+        max_connections: int = 50,
+        max_keepalive_connections: int = 10,
     ) -> None:
         # Local Ollama has no meaningful request-latency SLA comparable to a
         # hosted API, so the default timeout is longer than the hosted
@@ -54,6 +56,19 @@ class OllamaAdapter(ProviderAdapter):
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._timeout = timeout_seconds
+        # Phase 7 fix: ONE pooled client held for this adapter's lifetime —
+        # see docs/PHASE7_IMPLEMENTATION_GUIDE.md. Smaller default pool
+        # than the hosted adapters' — Ollama is typically a single local
+        # instance, not a horizontally scaled API.
+        self._client = httpx.AsyncClient(
+            timeout=timeout_seconds,
+            limits=httpx.Limits(
+                max_connections=max_connections, max_keepalive_connections=max_keepalive_connections
+            ),
+        )
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
     def _headers(self) -> dict:
         return {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
@@ -86,8 +101,7 @@ class OllamaAdapter(ProviderAdapter):
     async def call(self, payload: dict) -> dict:
         url = f"{self._base_url}/api/chat"
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.post(url, json=payload, headers=self._headers())
+            resp = await self._client.post(url, json=payload, headers=self._headers())
         except httpx.TimeoutException as exc:
             raise ProviderError(
                 "ollama request timed out", retryable=True, error_type="timeout"
@@ -141,42 +155,41 @@ class OllamaAdapter(ProviderAdapter):
         chunk_id = f"gw-{uuid.uuid4().hex[:24]}"
 
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                async with client.stream(
-                    "POST", url, json=payload, headers=self._headers()
-                ) as resp:
-                    if resp.status_code >= 400:
-                        body = await resp.aread()
-                        _raise_for_status_bytes(resp.status_code, body)
+            async with self._client.stream(
+                "POST", url, json=payload, headers=self._headers()
+            ) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    _raise_for_status_bytes(resp.status_code, body)
 
-                    async for line in resp.aiter_lines():
-                        if not line.strip():
-                            continue
-                        event = _json.loads(line)
-                        served_model = event.get("model", provider_model)
+                async for line in resp.aiter_lines():
+                    if not line.strip():
+                        continue
+                    event = _json.loads(line)
+                    served_model = event.get("model", provider_model)
 
-                        if event.get("done"):
-                            yield UnifiedStreamChunk(
-                                id=chunk_id,
-                                provider=self.provider_name,
-                                model_served=served_model,
-                                delta="",
-                                finish_reason="stop",
-                                usage=Usage(
-                                    input_tokens=event.get("prompt_eval_count", 0),
-                                    output_tokens=event.get("eval_count", 0),
-                                ),
-                            )
-                            break
+                    if event.get("done"):
+                        yield UnifiedStreamChunk(
+                            id=chunk_id,
+                            provider=self.provider_name,
+                            model_served=served_model,
+                            delta="",
+                            finish_reason="stop",
+                            usage=Usage(
+                                input_tokens=event.get("prompt_eval_count", 0),
+                                output_tokens=event.get("eval_count", 0),
+                            ),
+                        )
+                        break
 
-                        delta_text = event.get("message", {}).get("content", "")
-                        if delta_text:
-                            yield UnifiedStreamChunk(
-                                id=chunk_id,
-                                provider=self.provider_name,
-                                model_served=served_model,
-                                delta=delta_text,
-                            )
+                    delta_text = event.get("message", {}).get("content", "")
+                    if delta_text:
+                        yield UnifiedStreamChunk(
+                            id=chunk_id,
+                            provider=self.provider_name,
+                            model_served=served_model,
+                            delta=delta_text,
+                        )
         except httpx.TimeoutException as exc:
             raise ProviderError(
                 "ollama stream timed out", retryable=True, error_type="timeout"

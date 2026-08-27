@@ -97,6 +97,7 @@ class TeamConfigStore:
                 "budget_period": team.budget_period,
                 "priority_tier": team.priority_tier,
                 "policy": team.policy.model_dump_json(),
+                "org_id": team.org_id,
             },
         )
         pipe.sadd(_TEAM_IDS_KEY, team.team_id)
@@ -115,6 +116,11 @@ class TeamConfigStore:
             budget_period=raw.get("budget_period", "monthly"),
             priority_tier=raw.get("priority_tier", "realtime"),
             policy=TeamPolicy.model_validate_json(raw.get("policy") or "{}"),
+            # Phase 8: absent for any team written to Redis before Phase 8
+            # shipped — falls back to TeamConfig's own DEFAULT_ORG_ID
+            # default via config.py's import, kept local here to avoid a
+            # second import just for the one constant.
+            org_id=raw.get("org_id") or "default-org",
         )
 
     # -- reads -------------------------------------------------------------

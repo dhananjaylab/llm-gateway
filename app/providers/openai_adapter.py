@@ -43,6 +43,15 @@ HTTP status classification
 ──────────────────────────
   Retryable:     429, 502, 503, 504
   Non-retryable: 400, 401, 403 (and any other 4xx/5xx)
+
+Phase 8 additions (tool calling + structured outputs)
+──────────────────────────────────────────────────────
+  tools / tool_choice forward near-verbatim (OpenAI's own `tools`/`tool_choice`
+  shape is already the gateway's canonical shape for this adapter). A tool
+  call + its result round-trip as two TYPED ITEMS in `input`
+  (`function_call` / `function_call_output`), not message roles — see
+  `translate_request`'s own docstring. `response_format.type == "json_schema"`
+  maps to `text.format = {"type":"json_schema", "name", "schema", "strict"}`.
 """
 
 from __future__ import annotations
@@ -56,6 +65,8 @@ import httpx
 
 from app.core.schema import (
     ChatMessage,
+    ForcedToolChoice,
+    ToolCall,
     UnifiedChatRequest,
     UnifiedChatResponse,
     UnifiedChoice,
@@ -106,10 +117,37 @@ class OpenAIAdapter(ProviderAdapter):
         forwarded here.  If an older model (e.g. gpt-4o) is added to this
         adapter's scope later, forwarding those fields would need to become
         conditional on provider_model.
+
+        Phase 8: a tool call and its result are two separate TYPED ITEMS in
+        `input`, not message roles — this is the OpenAI-specific quirk
+        docs/PHASE8_KICKOFF_SCOPING.md §3.1 calls out. A unified assistant
+        message carrying `tool_calls` becomes one optional plain-text item
+        (if it also has content) plus one `function_call` item per call; a
+        unified `tool`-role message becomes one `function_call_output` item.
+        `ToolCall.arguments` is already a JSON string (this adapter's own
+        canonical shape — see schema.py's ToolCall docstring), so no
+        json.dumps/loads is needed on this path, unlike every other adapter.
         """
-        input_items: list[dict] = [
-            {"role": m.role, "content": m.content} for m in request.messages
-        ]
+        input_items: list[dict] = []
+        for m in request.messages:
+            if m.role == "assistant" and m.tool_calls:
+                if m.content:
+                    input_items.append({"role": "assistant", "content": m.content})
+                for call in m.tool_calls:
+                    input_items.append(
+                        {
+                            "type": "function_call",
+                            "call_id": call.id,
+                            "name": call.name,
+                            "arguments": call.arguments,
+                        }
+                    )
+            elif m.role == "tool":
+                input_items.append(
+                    {"type": "function_call_output", "call_id": m.tool_call_id, "output": m.content}
+                )
+            else:
+                input_items.append({"role": m.role, "content": m.content})
 
         payload: dict = {
             "model": provider_model,
@@ -122,8 +160,33 @@ class OpenAIAdapter(ProviderAdapter):
         if request.system:
             payload["instructions"] = request.system
 
+        if request.tools:
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                    "strict": t.strict,
+                }
+                for t in request.tools
+            ]
+            if request.tool_choice is not None:
+                payload["tool_choice"] = _translate_tool_choice(request.tool_choice)
+
         if request.response_format is not None:
-            payload["text"] = {"format": {"type": request.response_format.type}}
+            if request.response_format.type == "json_schema":
+                js = request.response_format.json_schema or {}
+                payload["text"] = {
+                    "format": {
+                        "type": "json_schema",
+                        "name": js.get("name", "response"),
+                        "schema": js["schema"],
+                        "strict": js.get("strict", True),
+                    }
+                }
+            else:
+                payload["text"] = {"format": {"type": request.response_format.type}}
 
         return payload
 
@@ -167,7 +230,8 @@ class OpenAIAdapter(ProviderAdapter):
             cache_read_input_tokens=input_tokens_details.get("cached_tokens", 0),
         )
         message_content = _extract_responses_text(raw)
-        finish_reason = _extract_responses_finish_reason(raw)
+        tool_calls = _extract_responses_tool_calls(raw)
+        finish_reason = "tool_calls" if tool_calls else _extract_responses_finish_reason(raw)
         model_served = raw.get("model", provider_model)
         # Responses API returns created_at (int epoch seconds); fall back to
         # local time if absent.
@@ -181,7 +245,9 @@ class OpenAIAdapter(ProviderAdapter):
             choices=[
                 UnifiedChoice(
                     index=0,
-                    message=ChatMessage(role="assistant", content=message_content),
+                    message=ChatMessage(
+                        role="assistant", content=message_content, tool_calls=tool_calls or None
+                    ),
                     finish_reason=finish_reason,
                 )
             ],
@@ -320,6 +386,33 @@ def _extract_responses_finish_reason(raw: dict) -> str | None:
                 return "stop"
             return status
     return None
+
+
+def _extract_responses_tool_calls(raw: dict) -> list[ToolCall]:
+    """
+    Phase 8: `output[]` items with `type == "function_call"` are OpenAI's
+    tool-call shape — `arguments` is already the JSON-encoded string this
+    gateway's own `ToolCall.arguments` canonically stores, so this is a
+    direct passthrough, unlike Anthropic/Gemini/Ollama's parsed-object
+    shapes (see each of those adapters' own extraction helpers).
+    """
+    calls: list[ToolCall] = []
+    for item in raw.get("output") or []:
+        if item.get("type") == "function_call":
+            calls.append(
+                ToolCall(
+                    id=item.get("call_id") or item.get("id", ""),
+                    name=item.get("name", ""),
+                    arguments=item.get("arguments", "{}"),
+                )
+            )
+    return calls
+
+
+def _translate_tool_choice(tool_choice) -> str | dict:
+    if isinstance(tool_choice, ForcedToolChoice):
+        return {"type": "function", "name": tool_choice.name}
+    return tool_choice
 
 
 def _raise_for_status(resp: httpx.Response) -> None:

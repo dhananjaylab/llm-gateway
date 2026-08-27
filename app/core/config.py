@@ -24,6 +24,15 @@ Phase 3 additions:
       60s cooldown) rather than a rolling error-rate percentage.
     * retry_* — max attempts and backoff bounds for
       app/resilience/retry.py's full-jitter exponential backoff.
+Phase 8 addition:
+- `org_id` on `TeamConfig` (default `"default-org"`, fully backward
+  compatible — every Phase 1-7 team config without an explicit org_id
+  gets this default) plus `OrgConfig`/`load_orgs_config()`, mirroring
+  `TeamConfig`/`load_teams_config()` for the org-level quota tier
+  (docs/PHASE8_KICKOFF_SCOPING.md §6, Option A — org-level only, per
+  explicit developer sign-off). `OrgConfigStore` (app/core/org_store.py)
+  is the Redis-backed, hot-reloadable runtime store, mirroring
+  `TeamConfigStore` exactly.
 """
 
 from __future__ import annotations
@@ -39,8 +48,10 @@ from pydantic import BaseModel, Field
 _DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "teams.yaml"
 _DEFAULT_PRICING_PATH = Path(__file__).resolve().parents[2] / "config" / "pricing.yaml"
 _DEFAULT_TIERS_PATH = Path(__file__).resolve().parents[2] / "config" / "tiers.yaml"
+_DEFAULT_ORGS_PATH = Path(__file__).resolve().parents[2] / "config" / "orgs.yaml"
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _last_loaded_dotenv_root: Path | None = None
+DEFAULT_ORG_ID = "default-org"
 
 
 def _load_project_dotenv(force: bool = False) -> None:
@@ -69,6 +80,24 @@ class TeamConfig(BaseModel):
     budget_period: str = "monthly"
     priority_tier: str = "realtime"
     policy: TeamPolicy = Field(default_factory=TeamPolicy)
+    org_id: str = DEFAULT_ORG_ID
+
+
+class OrgConfig(BaseModel):
+    """
+    The org-level quota tier above team (Phase 8, Option A — see module
+    docstring). Every team belongs to exactly one org (`TeamConfig.org_id`,
+    defaulting to `DEFAULT_ORG_ID`) and every deployment always has at
+    least `DEFAULT_ORG_ID` seeded (see `OrgConfigStore.seed_from_yaml_if_empty`
+    in app/core/org_store.py) — so org-level enforcement is always active,
+    not an opt-in a team can silently fall outside of.
+    """
+
+    org_id: str
+    rpm_cap: int = 1000
+    tpm_cap: int = 500_000
+    budget_cap_usd: float = 5000.0
+    budget_period: str = "monthly"
 
 
 class GatewayConfig(BaseModel):
@@ -99,6 +128,30 @@ def get_gateway_config() -> GatewayConfig:
 
 def reset_config_cache() -> None:
     get_gateway_config.cache_clear()
+
+
+class GatewayOrgsConfig(BaseModel):
+    orgs: dict[str, OrgConfig]
+
+
+def load_orgs_config(path: str | Path | None = None) -> GatewayOrgsConfig:
+    """Bootstrap-seed loader for config/orgs.yaml, mirroring
+    load_teams_config() exactly — Redis is the runtime source of truth
+    once seeded (see app/core/org_store.py::OrgConfigStore)."""
+    config_path = Path(path) if path else Path(os.environ.get("ORGS_CONFIG_PATH", _DEFAULT_ORGS_PATH))
+    if not config_path.exists():
+        # A deployment with no orgs.yaml at all still works: DEFAULT_ORG_ID
+        # is synthesized with the OrgConfig model's own generous defaults
+        # so org-level enforcement never blocks on missing config.
+        return GatewayOrgsConfig(orgs={DEFAULT_ORG_ID: OrgConfig(org_id=DEFAULT_ORG_ID)})
+    with open(config_path, encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    orgs: dict[str, OrgConfig] = {}
+    for org_id, org_raw in (raw.get("orgs") or {}).items():
+        orgs[org_id] = OrgConfig(org_id=org_id, **(org_raw or {}))
+    if DEFAULT_ORG_ID not in orgs:
+        orgs[DEFAULT_ORG_ID] = OrgConfig(org_id=DEFAULT_ORG_ID)
+    return GatewayOrgsConfig(orgs=orgs)
 
 
 class ProviderSettings(BaseModel):
@@ -220,6 +273,7 @@ class GatewaySettings(BaseModel):
 
     pricing_path: str = str(_DEFAULT_PRICING_PATH)
     tiers_path: str = str(_DEFAULT_TIERS_PATH)
+    orgs_path: str = str(_DEFAULT_ORGS_PATH)
 
     # -- Phase 3: health checking -----------------------------------------
     # TRD: "send lightweight test requests every 30 seconds... maintain a
@@ -339,6 +393,7 @@ def get_gateway_settings() -> GatewaySettings:
         batch_queue_max_length=int(os.environ.get("BATCH_QUEUE_MAX_LENGTH", "200")),
         pricing_path=os.environ.get("PRICING_PATH", str(_DEFAULT_PRICING_PATH)),
         tiers_path=os.environ.get("TIERS_CONFIG_PATH", str(_DEFAULT_TIERS_PATH)),
+        orgs_path=os.environ.get("ORGS_CONFIG_PATH", str(_DEFAULT_ORGS_PATH)),
         health_check_enabled=_env_bool("HEALTH_CHECK_ENABLED", True),
         health_check_interval_seconds=float(os.environ.get("HEALTH_CHECK_INTERVAL_SECONDS", "30.0")),
         health_check_probe_timeout_seconds=float(

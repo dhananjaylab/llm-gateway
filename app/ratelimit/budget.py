@@ -25,6 +25,16 @@ Fail-closed (TRD Appendix A, resolved, not a toggle): if Redis is
 unreachable, `precheck()` raises rather than silently allowing spend to
 go unmetered — "safer for budget enforcement" per the TRD's own stated
 reasoning. Contrast with RateLimiter, which is fail-OPEN by default.
+
+Phase 8: `precheck_org`/`record_spend_org` (docs/PHASE8_KICKOFF_SCOPING.md
+§6, Option A) reuse `budget_increment.lua` UNCHANGED — that script never
+hardcoded "team" anywhere in its logic, it only ever operated on whatever
+KEYS[1] it was given — keyed by `period_key_for_org()` instead of
+`period_key()` so an org's budget ledger lives in a namespace
+(`budget:org:{org_id}:{period}`) that can never collide with a team's
+(`budget:{team_id}:{period}`) even if the two id strings happen to match.
+Same fail-closed posture as the team path: an org-level Redis outage
+during precheck also raises `BudgetUnavailableError`.
 """
 
 from __future__ import annotations
@@ -38,7 +48,7 @@ from pathlib import Path
 from redis import exceptions as redis_exceptions
 from redis.asyncio import Redis
 
-from app.core.config import TeamConfig
+from app.core.config import OrgConfig, TeamConfig
 from app.core.redis_script import LuaScript
 from app.observability.metrics import GatewayMetrics
 
@@ -75,6 +85,16 @@ def period_key(team_id: str, budget_period: str, *, now: datetime | None = None)
 
     ttl = max(60, seconds_in_period - elapsed + 3600)  # +1h buffer past rollover
     return f"budget:{team_id}:{period_label}", ttl
+
+
+def period_key_for_org(org_id: str, budget_period: str, *, now: datetime | None = None) -> tuple[str, int]:
+    """Org-level counterpart of period_key() — same period-label/ttl math,
+    namespaced under `budget:org:{org_id}:...` so it can never collide
+    with a team's `budget:{team_id}:...` key even if the two id strings
+    are identical."""
+    team_shaped_key, ttl = period_key(org_id, budget_period, now=now)
+    _, period_label = team_shaped_key.rsplit(":", 1)
+    return f"budget:org:{org_id}:{period_label}", ttl
 
 
 class BudgetEnforcer:
@@ -165,6 +185,65 @@ class BudgetEnforcer:
                 (float(new_spend) / float(cap)) * 100 if float(cap) else 0.0,
             )
 
+        return BudgetDecision(
+            allowed=True,
+            spend_usd=float(new_spend),
+            cap_usd=float(cap),
+            period=key.rsplit(":", 1)[-1],
+            warning_fraction=(float(new_spend) / float(cap)) if crossed_warning and float(cap) else None,
+        )
+
+    # -- org-level (Phase 8, Option A) ---------------------------------------
+
+    async def precheck_org(self, org: OrgConfig) -> BudgetDecision:
+        """Org-level counterpart of precheck() — same read-only,
+        never-mutates-state contract, keyed by period_key_for_org()."""
+        key, _ = period_key_for_org(org.org_id, org.budget_period)
+        try:
+            raw = await self._redis.hmget(key, "spend_usd")
+        except (redis_exceptions.ConnectionError, redis_exceptions.TimeoutError) as exc:
+            raise BudgetUnavailableError(
+                f"redis unavailable during org budget precheck for org={org.org_id}"
+            ) from exc
+
+        spend = float(raw[0]) if raw[0] is not None else 0.0
+        cap = org.budget_cap_usd
+        return BudgetDecision(
+            allowed=spend < cap,
+            spend_usd=spend,
+            cap_usd=cap,
+            period=key.rsplit(":", 1)[-1],
+        )
+
+    async def record_spend_org(self, org: OrgConfig, cost_usd: float) -> BudgetDecision:
+        """Org-level counterpart of record_spend() — same best-effort
+        posture on a Redis outage (the request already succeeded; a
+        missed org-ledger write is logged loudly, not fatal)."""
+        key, ttl = period_key_for_org(org.org_id, org.budget_period)
+        try:
+            raw = await self._script.eval(
+                keys=[key], args=[cost_usd, org.budget_cap_usd, self._warn_fraction, ttl]
+            )
+        except (redis_exceptions.ConnectionError, redis_exceptions.TimeoutError):
+            logger.error(
+                "redis unavailable while recording org spend for org=%s cost_usd=%.6f — "
+                "spend NOT persisted, org budget ledger will undercount until Redis recovers",
+                org.org_id,
+                cost_usd,
+                exc_info=True,
+            )
+            return BudgetDecision(allowed=True, spend_usd=0.0, cap_usd=org.budget_cap_usd, period=key)
+
+        new_spend, cap, crossed_warning = raw
+        crossed_warning = bool(int(crossed_warning))
+        if crossed_warning:
+            logger.warning(
+                "org budget warning: org=%s spend_usd=%s cap_usd=%s (%.0f%% of cap)",
+                org.org_id,
+                new_spend,
+                cap,
+                (float(new_spend) / float(cap)) * 100 if float(cap) else 0.0,
+            )
         return BudgetDecision(
             allowed=True,
             spend_usd=float(new_spend),

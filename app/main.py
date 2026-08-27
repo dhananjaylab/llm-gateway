@@ -43,7 +43,8 @@ from redis.asyncio import Redis
 from app.api.admin import router as admin_router
 from app.api.v1_chat import router as v1_chat_router
 from app.core.audit import AuditLog
-from app.core.config import get_gateway_settings, load_teams_config, load_tiers_config
+from app.core.config import get_gateway_settings, load_orgs_config, load_teams_config, load_tiers_config
+from app.core.org_store import OrgConfigStore
 from app.core.pricing import load_pricing
 from app.core.redis_client import build_redis_client
 from app.core.team_store import TeamConfigStore
@@ -63,28 +64,28 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gateway.main")
 
 
-async def _listen_for_config_changes(app: FastAPI) -> None:
+async def _listen_for_store_changes(app: FastAPI, *, channel: str, invalidate) -> None:
     """
-    Background task: invalidate this instance's local TeamConfigStore
-    cache the moment ANY instance (including this one, redundantly but
-    harmlessly) PATCHes a team via the Admin API. See team_store.py's
-    module docstring for why this exists alongside the short cache TTL
-    rather than instead of it.
+    Generic background listener shared by the team-config channel (Phase
+    2) and the org-config channel (Phase 8, docs/PHASE8_KICKOFF_SCOPING.md
+    §6) — both TeamConfigStore and OrgConfigStore PUBLISH their own
+    changed id as the message body on their own channel, so `invalidate`
+    is just `store.invalidate` bound to whichever store owns `channel`.
     """
     redis: Redis = app.state.redis
     pubsub = redis.pubsub()
-    await pubsub.subscribe(TeamConfigStore.CONFIG_CHANGE_CHANNEL)
+    await pubsub.subscribe(channel)
     try:
         async for message in pubsub.listen():
             if message.get("type") != "message":
                 continue
-            team_id = message["data"]
-            app.state.team_store.invalidate(team_id)
-            logger.debug("config-change event: invalidated cache for team=%s", team_id)
+            entity_id = message["data"]
+            invalidate(entity_id)
+            logger.debug("config-change event on %s: invalidated cache for %s", channel, entity_id)
     except asyncio.CancelledError:
         pass
     finally:
-        await pubsub.unsubscribe(TeamConfigStore.CONFIG_CHANGE_CHANNEL)
+        await pubsub.unsubscribe(channel)
         await pubsub.aclose()
 
 
@@ -97,6 +98,7 @@ def _build_lifespan(redis_client_override: Redis | None):
 
         app.state.redis = redis_client
         app.state.team_store = TeamConfigStore(redis_client)
+        app.state.org_store = OrgConfigStore(redis_client)
 
         # -- Phase 4: metrics --------------------------------------------------
         # Built early -- BudgetEnforcer, CircuitBreaker, and FallbackRouter
@@ -178,7 +180,22 @@ def _build_lifespan(redis_client_override: Redis | None):
         if seeded:
             logger.info("bootstrap-seeded %d teams into Redis from config/teams.yaml", seeded)
 
-        listener_task = asyncio.create_task(_listen_for_config_changes(app))
+        seeded_orgs = await app.state.org_store.seed_from_yaml_if_empty(load_orgs_config(settings.orgs_path))
+        if seeded_orgs:
+            logger.info("bootstrap-seeded %d org(s) into Redis from config/orgs.yaml", seeded_orgs)
+
+        listener_task = asyncio.create_task(
+            _listen_for_store_changes(
+                app,
+                channel=TeamConfigStore.CONFIG_CHANGE_CHANNEL,
+                invalidate=app.state.team_store.invalidate,
+            )
+        )
+        org_listener_task = asyncio.create_task(
+            _listen_for_store_changes(
+                app, channel=OrgConfigStore.CONFIG_CHANGE_CHANNEL, invalidate=app.state.org_store.invalidate
+            )
+        )
 
         health_checker_task: asyncio.Task | None = None
         if settings.health_check_enabled:
@@ -205,6 +222,9 @@ def _build_lifespan(redis_client_override: Redis | None):
             listener_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await listener_task
+            org_listener_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await org_listener_task
             if health_checker_task is not None:
                 health_checker_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

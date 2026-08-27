@@ -227,6 +227,96 @@ async def get_audit(
     return [AuditEntryView(**e) for e in entries]
 
 
+# -- Phase 8: orgs (Option A, org-level quotas only) -------------------------
+#
+# One combined GET/PATCH per org rather than mirroring team's split
+# /limits + /budgets pair — a deliberate simplification for this phase's
+# smaller surface (docs/PHASE8_KICKOFF_SCOPING.md §6/§8), flagged
+# explicitly rather than silently diverging from the team pattern. The
+# underlying mechanics (Redis-backed hot-reload via OrgConfigStore, audit
+# logging) mirror the team path exactly; only the URL/view shape is
+# combined.
+
+
+class OrgView(BaseModel):
+    org_id: str
+    rpm_cap: int
+    tpm_cap: int
+    remaining_rpm: int
+    remaining_tpm: int
+    budget_cap_usd: float
+    budget_period: str
+    spend_usd: float
+    period_label: str
+
+
+class OrgPatch(BaseModel):
+    rpm_cap: int | None = Field(default=None, gt=0)
+    tpm_cap: int | None = Field(default=None, gt=0)
+    budget_cap_usd: float | None = Field(default=None, gt=0)
+
+
+async def _org_view(org_id: str, org, request: Request) -> OrgView:
+    rl_peek = await request.app.state.rate_limiter.peek_org(org)
+    budget_decision = await request.app.state.budget_enforcer.precheck_org(org)
+    return OrgView(
+        org_id=org_id,
+        rpm_cap=org.rpm_cap,
+        tpm_cap=org.tpm_cap,
+        remaining_rpm=rl_peek.remaining_rpm or 0,
+        remaining_tpm=rl_peek.remaining_tpm or 0,
+        budget_cap_usd=budget_decision.cap_usd,
+        budget_period=org.budget_period,
+        spend_usd=budget_decision.spend_usd,
+        period_label=budget_decision.period,
+    )
+
+
+@router.get("/orgs/{org_id}", response_model=OrgView)
+async def get_org(org_id: str, request: Request, actor: str = Depends(require_admin)) -> OrgView:
+    org = await request.app.state.org_store.get_org(org_id)
+    if org is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"error": {"type": "org_not_found"}})
+    return await _org_view(org_id, org, request)
+
+
+@router.patch("/orgs/{org_id}", response_model=OrgView)
+async def patch_org(
+    org_id: str, patch: OrgPatch, request: Request, actor: str = Depends(require_admin)
+) -> OrgView:
+    store = request.app.state.org_store
+    before = await store.get_org(org_id)
+    if before is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"error": {"type": "org_not_found"}})
+
+    changes = patch.model_dump(exclude_none=True)
+    if not changes:
+        return await _org_view(org_id, before, request)
+
+    try:
+        after = await store.update_org(org_id, changes)
+    except KeyError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"error": {"type": "org_not_found"}}) from exc
+
+    await request.app.state.audit_log.record(
+        actor=actor,
+        action="patch_org",
+        team_id=org_id,  # AuditLog's schema is (actor, action, team_id, before, after) — reused
+        # as-is for an org_id rather than adding a parallel org_id column;
+        # /admin/audit entries are already disambiguated by `action`
+        # ("patch_org" vs "patch_limits"/"patch_budget"), so this stays a
+        # single, consistent audit trail rather than a second one.
+        before={
+            "rpm_cap": before.rpm_cap,
+            "tpm_cap": before.tpm_cap,
+            "budget_cap_usd": before.budget_cap_usd,
+        },
+        after={"rpm_cap": after.rpm_cap, "tpm_cap": after.tpm_cap, "budget_cap_usd": after.budget_cap_usd},
+    )
+
+    return await _org_view(org_id, after, request)
+
+
 # -- Phase 3: health + circuits (read-only, ahead of Phase 4 Grafana) --------
 
 

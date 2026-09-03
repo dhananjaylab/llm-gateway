@@ -67,7 +67,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
 
 from app.core.auth import enforce_model_allowed, resolve_team
-from app.core.config import TeamConfig
+from app.core.config import OrgConfig, TeamConfig
 from app.core.policy import apply_policy
 from app.core.pricing import calculate_cost_usd
 from app.core.schema import UnifiedChatRequest, UnifiedChatResponse, Usage
@@ -123,6 +123,52 @@ def _budget_exceeded_exception(team: TeamConfig, budget_decision) -> HTTPExcepti
     )
 
 
+def _org_budget_exceeded_exception(org: OrgConfig, budget_decision) -> HTTPException:
+    """
+    Phase 8, Option A (docs/PHASE8_KICKOFF_SCOPING.md §6): the org-level
+    counterpart of _budget_exceeded_exception, distinguished in the body
+    by `"level": "org"` and `org_id` so client-side error handling can
+    tell an org-wide block apart from this team's own 402 without any
+    other signal — Document 03's own HTTP-contract philosophy ("every
+    non-2xx response must be self-explanatory") applied one level up.
+    """
+    return HTTPException(
+        status_code=status.HTTP_402_PAYMENT_REQUIRED,
+        detail={
+            "error": {
+                "type": "budget_exceeded",
+                "level": "org",
+                "message": (
+                    f"Org '{org.org_id}' has reached its {org.budget_period} "
+                    f"budget cap for {budget_decision.period}."
+                ),
+                "org_id": org.org_id,
+                "spend_usd": budget_decision.spend_usd,
+                "cap_usd": budget_decision.cap_usd,
+                "period": budget_decision.period,
+            }
+        },
+    )
+
+
+def _org_rate_limited_exception(org: OrgConfig, rl_decision) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail={
+            "error": {
+                "type": "rate_limit_exceeded",
+                "level": "org",
+                "message": f"Org rate limit exceeded on {rl_decision.limit_type or 'rpm/tpm'}.",
+                "org_id": org.org_id,
+                "limit_type": f"org_{rl_decision.limit_type}" if rl_decision.limit_type else None,
+                "remaining_rpm": rl_decision.remaining_rpm,
+                "remaining_tpm": rl_decision.remaining_tpm,
+            }
+        },
+        headers={"Retry-After": str(rl_decision.retry_after_seconds or 1)},
+    )
+
+
 @router.post(
     "/v1/chat/completions",
     response_model=None,
@@ -143,6 +189,7 @@ async def chat_completions(
     combined_quota_checker = app_state.combined_quota_checker
     pricing_table = app_state.pricing
     fallback_router = app_state.fallback_router
+    org_store = app_state.org_store
 
     request_start = time.perf_counter()
     # Best-effort labels for the outer requests_total/duration recording
@@ -153,6 +200,14 @@ async def chat_completions(
     # placeholder standing in for missing data.
     provider_label = ""
     model_label = request.model
+    # Resolved inside the span below, referenced by every later
+    # reconcile/record_spend call site (success path, non-streaming error
+    # paths, and passed into the streaming helper) -- see module
+    # docstring's Phase 8 note. `None` only if the team's org_id has no
+    # matching OrgConfig row in Redis at all (not expected in practice —
+    # OrgConfigStore always seeds "default-org" — but handled as "skip
+    # org-level enforcement for this request" rather than a 500).
+    org: OrgConfig | None = None
 
     try:
         with internal_span(
@@ -162,6 +217,57 @@ async def chat_completions(
 
             # -- stage 4a+4b: budget + rate limit -----------------------------
             estimated_tokens = estimate_reserved_tokens(request)
+
+            # -- Phase 8, Option A: org-level quota check, evaluated BEFORE
+            # the team-level check below -- an org-wide block should never
+            # let a request reach (and partially consume) team-level
+            # capacity it was never going to be allowed to use. Two Redis
+            # round trips (org, then team) rather than Phase 7's single
+            # combined one for team alone -- org-level enforcement is
+            # additive on top of that already-tested optimization, not a
+            # rewrite of it. See docs/PHASE8_KICKOFF_SCOPING.md §6.
+            org = await org_store.get_org(team.org_id)
+            if org is None:
+                logger.warning(
+                    "team=%s has org_id=%s but no matching OrgConfig exists in Redis — "
+                    "skipping org-level enforcement for this request",
+                    team.team_id,
+                    team.org_id,
+                )
+            else:
+                try:
+                    org_budget_decision = await budget_enforcer.precheck_org(org)
+                except BudgetUnavailableError as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail={
+                            "error": {
+                                "type": "budget_check_unavailable",
+                                "level": "org",
+                                "message": "Org budget ledger is temporarily unavailable; failing closed.",
+                            }
+                        },
+                    ) from exc
+
+                if not org_budget_decision.allowed:
+                    if metrics is not None:
+                        # Reuses the existing team_id-labeled counter (no
+                        # Document-05-diverging metrics schema change this
+                        # phase) -- an org-level denial is not separately
+                        # distinguishable from a team-level one in
+                        # gen_ai_budget_applied_total today; flagged as a
+                        # known limitation, not silently conflated.
+                        metrics.budget_applied_total.labels(team_id=team.team_id).inc()
+                    raise _org_budget_exceeded_exception(org, org_budget_decision)
+
+                org_rl_decision = await rate_limiter.check_org(org, estimated_tokens)
+                if not org_rl_decision.allowed:
+                    if metrics is not None:
+                        metrics.rate_limit_applied_total.labels(
+                            team_id=team.team_id,
+                            limit_type=f"org_{org_rl_decision.limit_type or 'unknown'}",
+                        ).inc()
+                    raise _org_rate_limited_exception(org, org_rl_decision)
 
             if request.priority == "batch":
                 # Batch priority keeps its own separate budget precheck +
@@ -258,6 +364,7 @@ async def chat_completions(
                     request=enriched_request,
                     http_request=http_request,
                     team=team,
+                    org=org,
                     reserved_tokens=estimated_tokens,
                     rate_limiter=rate_limiter,
                     budget_enforcer=budget_enforcer,
@@ -289,6 +396,8 @@ async def chat_completions(
             # request (a one-link chain that fails to resolve raises this
             # same exception type).
             await rate_limiter.reconcile(team=team, reserved_tokens=estimated_tokens, actual_tokens=0)
+            if org is not None:
+                await rate_limiter.reconcile_org(org=org, reserved_tokens=estimated_tokens, actual_tokens=0)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail={"error": {"type": "unknown_provider", "message": str(exc)}},
@@ -297,11 +406,15 @@ async def chat_completions(
             # A non-retryable error bubbled straight through the chain walk —
             # Document 03: never retried, never triggers fallback.
             await rate_limiter.reconcile(team=team, reserved_tokens=estimated_tokens, actual_tokens=0)
+            if org is not None:
+                await rate_limiter.reconcile_org(org=org, reserved_tokens=estimated_tokens, actual_tokens=0)
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY, detail=_provider_error_response(exc)
             ) from exc
         except FallbackExhaustedError as exc:
             await rate_limiter.reconcile(team=team, reserved_tokens=estimated_tokens, actual_tokens=0)
+            if org is not None:
+                await rate_limiter.reconcile_org(org=org, reserved_tokens=estimated_tokens, actual_tokens=0)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=_fallback_exhausted_response(exc),
@@ -316,6 +429,11 @@ async def chat_completions(
 
         cost_usd = calculate_cost_usd(pricing_table, unified.provider, unified.model_served, unified.usage)
         budget_result = await budget_enforcer.record_spend(team, cost_usd)
+        if org is not None:
+            await rate_limiter.reconcile_org(
+                org=org, reserved_tokens=estimated_tokens, actual_tokens=unified.usage.total_tokens
+            )
+            await budget_enforcer.record_spend_org(org, cost_usd)
         if budget_result.warning_fraction is not None:
             response.headers["X-Budget-Warning"] = f"{budget_result.warning_fraction:.2f}"
         # Which provider:model actually served this — meaningful now that it
@@ -355,6 +473,7 @@ async def chat_completions(
 async def _reconcile_and_bill_partial(
     *,
     team: TeamConfig,
+    org: OrgConfig | None = None,
     reserved_tokens: int,
     accumulated_text: str,
     final_usage: Usage | None,
@@ -411,11 +530,17 @@ async def _reconcile_and_bill_partial(
 
     actual_tokens = usage.total_tokens if usage is not None else 0
     await rate_limiter.reconcile(team=team, reserved_tokens=reserved_tokens, actual_tokens=actual_tokens)
+    if org is not None:
+        await rate_limiter.reconcile_org(
+            org=org, reserved_tokens=reserved_tokens, actual_tokens=actual_tokens
+        )
 
     if usage is not None and final_provider is not None:
         model_label = final_model_served or tier_or_model
         cost_usd = calculate_cost_usd(pricing_table, final_provider, model_label, usage)
         await budget_enforcer.record_spend(team, cost_usd)
+        if org is not None:
+            await budget_enforcer.record_spend_org(org, cost_usd)
         record_token_usage_and_cost(
             metrics,
             team_id=team.team_id,
@@ -436,6 +561,7 @@ async def _stream_response(
     request: UnifiedChatRequest,
     http_request: Request,
     team: TeamConfig,
+    org: OrgConfig | None = None,
     reserved_tokens: int,
     rate_limiter,
     budget_enforcer,
@@ -527,6 +653,7 @@ async def _stream_response(
     except (ProviderError, FallbackExhaustedError) as exc:
         await _reconcile_and_bill_partial(
             team=team,
+            org=org,
             reserved_tokens=reserved_tokens,
             accumulated_text=accumulated_text,
             final_usage=final_usage,
@@ -560,6 +687,7 @@ async def _stream_response(
     else:
         await _reconcile_and_bill_partial(
             team=team,
+            org=org,
             reserved_tokens=reserved_tokens,
             accumulated_text=accumulated_text,
             final_usage=final_usage,

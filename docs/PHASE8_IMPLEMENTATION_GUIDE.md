@@ -111,8 +111,8 @@ Phase 5/7 content — same deferred-not-forgotten item Phase 7 itself flagged an
 ## New/changed files (this delivery only)
 
 ```
-app/core/schema.py                           # ToolDefinition, ToolCall, ForcedToolChoice, ToolChoiceMode,
-                                             # tool role, json_schema response format, streaming+tools guard
+app/core/schema.py                          # ToolDefinition, ToolCall, ForcedToolChoice, ToolChoiceMode,
+                                              #   tool role, json_schema response format, streaming+tools guard
 app/core/config.py                           # OrgConfig, load_orgs_config, TeamConfig.org_id, orgs_path setting
 app/core/org_store.py                        # NEW — OrgConfigStore
 app/core/team_store.py                       # persist/deserialize org_id

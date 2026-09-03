@@ -1,0 +1,25 @@
+# Org-level quota bootstrap seed — Phase 8, Option A (org-level hierarchical
+# quotas only; see docs/PHASE8_KICKOFF_SCOPING.md §6 for the fuller
+# org->team->app->user tree this deliberately does NOT build).
+#
+# Same "this file is only the bootstrap SEED" contract as config/teams.yaml
+# (Phase 2) — on first boot, if Redis has no org_config:* keys yet, the
+# gateway loads this file once and writes it into Redis
+# (app/core/org_store.py::OrgConfigStore.seed_from_yaml_if_empty). After
+# that, the Admin API (PATCH /admin/orgs/{org_id}) is the only mutation
+# path. Editing this file after first boot has no effect until Redis is
+# flushed — same caveat teams.yaml's own header already carries.
+#
+# `default-org` is not optional: every TeamConfig.org_id defaults to
+# "default-org" (app/core/config.py's DEFAULT_ORG_ID), and every existing
+# demo team in config/teams.yaml implicitly belongs to it without needing
+# any edit to that file. If this key is ever removed, load_orgs_config()
+# synthesizes it anyway with the OrgConfig model's own generous defaults —
+# org-level enforcement is always active, never a silent no-op.
+
+orgs:
+  default-org:
+    rpm_cap: 1000
+    tpm_cap: 500000
+    budget_cap_usd: 5000.00
+    budget_period: "monthly"

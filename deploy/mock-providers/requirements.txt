@@ -8,6 +8,6 @@
 # gateway's own requirements.txt (Aug 2026 pass) -- kept loosely pinned
 # to the same floor as the gateway's fastapi[standard]/uvicorn[standard]
 # so both images build from a consistent, already-verified baseline.
-fastapi[standard]>=0.136,<0.138
+fastapi[standard]>=0.141.1,<0.142
 uvicorn[standard]>=0.34,<0.35
 pydantic>=2.13.5,<3

@@ -1,9 +1,24 @@
 """
 Request enrichment: system-prompt injection and PII redaction.
 
-Unchanged from Phase 1 — Phase 2 does not touch policy application, only
-what happens before/after it in the pipeline (rate limit + budget now
-wrap it with real enforcement instead of stubs).
+Unchanged from Phase 1 through Phase 7 — only what happens before/after
+it in the pipeline changed across those phases.
+
+Phase 8 fix: redaction used to rebuild every message as
+`ChatMessage(role=m.role, content=redact_pii(m.content))`, unconditionally
+dropping any other field. That was silently correct through Phase 7
+(ChatMessage had no other fields), but Phase 8 added `tool_calls`/
+`tool_call_id` — rebuilding without them means a team with PII redaction
+enabled would have every tool-role message rebuilt with `tool_call_id`
+missing, which fails ChatMessage's own model_validator (a tool-role
+message must set tool_call_id), and every tool-calling assistant turn
+rebuilt with `tool_calls` dropped, corrupting the conversation. Redaction
+now only ever touches `content`, preserving every other field verbatim —
+`tool_calls`/`tool_call_id` are structured, model/tool-generated data,
+not free-form user text, so they are deliberately NOT scanned for PII
+this phase (a tool's arguments could in principle echo a redactable
+string the user typed, e.g. an email passed as a lookup key — flagged as
+a known, documented limitation rather than silently assumed safe).
 """
 
 from __future__ import annotations
@@ -31,7 +46,13 @@ def apply_policy(request: UnifiedChatRequest, team: TeamConfig) -> UnifiedChatRe
 
     if team.policy.pii_redaction:
         enriched.messages = [
-            ChatMessage(role=m.role, content=redact_pii(m.content)) for m in enriched.messages
+            ChatMessage(
+                role=m.role,
+                content=redact_pii(m.content),
+                tool_calls=m.tool_calls,
+                tool_call_id=m.tool_call_id,
+            )
+            for m in enriched.messages
         ]
 
     if team.policy.system_prompt_prefix:

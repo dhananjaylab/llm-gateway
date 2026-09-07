@@ -128,6 +128,36 @@ async def healthz():
 # -- OpenAI: POST /openai/v1/responses ----------------------------------------
 
 
+# Phase 8b (docs/PHASE8B_KICKOFF_SCOPING.md §7): tool-call-shaped
+# streaming fixtures for OpenAI/Anthropic/Ollama, gated on the request
+# actually carrying `tools` -- every one of the 10 existing wire-compat
+# tests sends a plain (no-tools) streaming or non-streaming request, so
+# none of them exercise this new branch and none needed to change. The
+# non-streaming tool-call mock responses remain unbuilt, per Phase 8's
+# own already-flagged open item (docs/PHASE8_IMPLEMENTATION_GUIDE.md) --
+# out of this phase's scope, which is streaming specifically.
+_MOCK_TOOL_ARGS_CHUNKS = ['{"city": ', '"Pune"}']
+_MOCK_TOOL_ARGS_WHOLE = {"city": "Pune"}
+
+
+def _mock_tool_call(payload: dict, *, provider: str) -> dict | None:
+    """Extracts (id, name) for the first tool the caller offered, per
+    that provider's own `tools` shape, so the mock echoes back a call to
+    whatever the test/client actually asked for rather than a
+    hardcoded name unrelated to the request. Returns None if `tools` is
+    absent or empty -- the caller uses that to fall back to the existing
+    plain-text stream."""
+    tools = payload.get("tools") or []
+    if not tools:
+        return None
+    first = tools[0]
+    if provider == "ollama":
+        name = (first.get("function") or {}).get("name", "mock_tool")
+    else:
+        name = first.get("name", "mock_tool")
+    return {"id": f"call_mock_{uuid.uuid4().hex[:12]}", "name": name}
+
+
 @app.post("/openai/v1/responses")
 async def openai_responses(request: Request):
     payload = await request.json()
@@ -135,7 +165,8 @@ async def openai_responses(request: Request):
     await chaos.apply(provider="openai", model=model)
 
     if payload.get("stream"):
-        return StreamingResponse(_openai_stream(model), media_type="text/event-stream")
+        tool_call = _mock_tool_call(payload, provider="openai")
+        return StreamingResponse(_openai_stream(model, tool_call=tool_call), media_type="text/event-stream")
 
     return {
         "id": f"resp_mock_{uuid.uuid4().hex[:16]}",
@@ -158,7 +189,25 @@ async def openai_responses(request: Request):
     }
 
 
-async def _openai_stream(model: str):
+async def _openai_stream(model: str, *, tool_call: dict | None = None):
+    if tool_call is not None:
+        added_data = {
+            "output_index": 0,
+            "item": {"type": "function_call", "call_id": tool_call["id"], "name": tool_call["name"]},
+        }
+        yield f"event: response.output_item.added\ndata: {json.dumps(added_data)}\n\n"
+        for arg_chunk in _MOCK_TOOL_ARGS_CHUNKS:
+            delta_data = {"output_index": 0, "delta": arg_chunk}
+            yield f"event: response.function_call_arguments.delta\ndata: {json.dumps(delta_data)}\n\n"
+        completed = {
+            "response": {
+                "model": model,
+                "usage": {"input_tokens": _MOCK_INPUT_TOKENS, "output_tokens": _MOCK_OUTPUT_TOKENS},
+            }
+        }
+        yield f"event: response.completed\ndata: {json.dumps(completed)}\n\n"
+        return
+
     for chunk in _MOCK_CHUNKS:
         yield f"event: response.output_text.delta\ndata: {json.dumps({'delta': chunk})}\n\n"
     completed = {
@@ -180,7 +229,10 @@ async def anthropic_messages(request: Request):
     await chaos.apply(provider="anthropic", model=model)
 
     if payload.get("stream"):
-        return StreamingResponse(_anthropic_stream(model), media_type="text/event-stream")
+        tool_call = _mock_tool_call(payload, provider="anthropic")
+        return StreamingResponse(
+            _anthropic_stream(model, tool_call=tool_call), media_type="text/event-stream"
+        )
 
     return {
         "id": f"msg_mock_{uuid.uuid4().hex[:16]}",
@@ -198,7 +250,7 @@ async def anthropic_messages(request: Request):
     }
 
 
-async def _anthropic_stream(model: str):
+async def _anthropic_stream(model: str, *, tool_call: dict | None = None):
     message_id = f"msg_mock_{uuid.uuid4().hex[:16]}"
 
     def sse(event: str, data: dict) -> str:
@@ -208,6 +260,30 @@ async def _anthropic_stream(model: str):
         "message_start",
         {"message": {"id": message_id, "model": model, "usage": {"input_tokens": _MOCK_INPUT_TOKENS}}},
     )
+
+    if tool_call is not None:
+        yield sse(
+            "content_block_start",
+            {
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use", "id": tool_call["id"], "name": tool_call["name"], "input": {}
+                },
+            },
+        )
+        for arg_chunk in _MOCK_TOOL_ARGS_CHUNKS:
+            yield sse(
+                "content_block_delta",
+                {"index": 0, "delta": {"type": "input_json_delta", "partial_json": arg_chunk}},
+            )
+        yield sse("content_block_stop", {"index": 0})
+        yield sse(
+            "message_delta",
+            {"delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": _MOCK_OUTPUT_TOKENS}},
+        )
+        yield sse("message_stop", {})
+        return
+
     for chunk in _MOCK_CHUNKS:
         yield sse("content_block_delta", {"delta": {"type": "text_delta", "text": chunk}})
     yield sse(
@@ -227,7 +303,10 @@ async def ollama_chat(request: Request):
     await chaos.apply(provider="ollama", model=model)
 
     if payload.get("stream"):
-        return StreamingResponse(_ollama_stream(model), media_type="application/x-ndjson")
+        tool_call = _mock_tool_call(payload, provider="ollama")
+        return StreamingResponse(
+            _ollama_stream(model, tool_call=tool_call), media_type="application/x-ndjson"
+        )
 
     return {
         "model": model,
@@ -240,7 +319,28 @@ async def ollama_chat(request: Request):
     }
 
 
-async def _ollama_stream(model: str):
+async def _ollama_stream(model: str, *, tool_call: dict | None = None):
+    if tool_call is not None:
+        tool_line = {
+            "model": model,
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": tool_call["name"], "arguments": _MOCK_TOOL_ARGS_WHOLE}}],
+            },
+            "done": False,
+        }
+        yield json.dumps(tool_line) + "\n"
+        final = {
+            "model": model,
+            "message": {"role": "assistant", "content": ""},
+            "done": True,
+            "prompt_eval_count": _MOCK_INPUT_TOKENS,
+            "eval_count": _MOCK_OUTPUT_TOKENS,
+        }
+        yield json.dumps(final) + "\n"
+        return
+
     for chunk in _MOCK_CHUNKS:
         line = {"model": model, "message": {"role": "assistant", "content": chunk}, "done": False}
         yield json.dumps(line) + "\n"

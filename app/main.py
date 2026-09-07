@@ -94,7 +94,12 @@ def _build_lifespan(redis_client_override: Redis | None):
     async def lifespan(app: FastAPI):
         settings = get_gateway_settings()
         owns_redis = redis_client_override is None
-        redis_client = redis_client_override or build_redis_client(settings.redis_url)
+        redis_client = redis_client_override or build_redis_client(
+            settings.redis_url,
+            socket_timeout=settings.redis_socket_timeout_seconds,
+            socket_connect_timeout=settings.redis_socket_connect_timeout_seconds,
+            max_connections=settings.redis_max_connections,
+        )
 
         app.state.redis = redis_client
         app.state.team_store = TeamConfigStore(redis_client)

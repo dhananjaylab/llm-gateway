@@ -56,15 +56,30 @@ def _request(**overrides) -> UnifiedChatRequest:
 # -- schema-level guard: tools + streaming is rejected up front -------------
 
 
-def test_tools_plus_streaming_is_rejected_at_the_schema_boundary():
-    with pytest.raises(Exception) as exc_info:
-        UnifiedChatRequest(
-            model="openai:gpt-5.4",
-            messages=[ChatMessage(role="user", content="hi")],
-            tools=[_SHARED_TOOL],
-            stream=True,
-        )
-    assert "stream" in str(exc_info.value).lower()
+def test_tools_plus_streaming_is_now_accepted_at_the_schema_boundary():
+    """
+    Phase 8b (docs/PHASE8B_KICKOFF_SCOPING.md §2.2): Phase 8's blanket
+    schema-level rejection of `tools + stream=True` is REMOVED, not
+    relaxed — replaces this test's Phase 8 name/assertion
+    (`test_tools_plus_streaming_is_rejected_at_the_schema_boundary`),
+    flipped to confirm acceptance. `model` may be a tier name resolved
+    into a provider chain later, so the schema layer can never correctly
+    know at construction time whether the eventual provider supports
+    streaming tool calls — that capability check now lives in the
+    adapter layer instead (each of OpenAI/Anthropic/Ollama's `stream()`
+    now understands tool-call events; GeminiAdapter.stream() continues to
+    unconditionally raise for any streaming attempt, tools or not, which
+    is already correct and sufficient enforcement for that one provider —
+    see test_streaming_tool_calls.py's Gemini-exclusion test).
+    """
+    req = UnifiedChatRequest(
+        model="openai:gpt-5.4",
+        messages=[ChatMessage(role="user", content="hi")],
+        tools=[_SHARED_TOOL],
+        stream=True,
+    )
+    assert req.stream is True
+    assert req.tools == [_SHARED_TOOL]
 
 
 def test_tools_without_streaming_is_fine():

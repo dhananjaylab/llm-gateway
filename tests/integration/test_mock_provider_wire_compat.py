@@ -242,3 +242,101 @@ async def test_chaos_latency_is_applied_without_forcing_an_error(monkeypatch):
         assert raw["output_text"]  # still succeeded, just slow
     finally:
         mock_chaos.clear()
+
+
+# -- Phase 8b: streaming tool-call mock endpoints ----------------------------
+#
+# Closes the open item Phase 8's own implementation guide flagged
+# ("deploy/mock-providers/main.py tool-call mock responses are still
+# unbuilt -- needed before tests/integration/ can exercise tool calling
+# against the real containerized stack"). Same strongest-available check
+# this file's own docstring describes: the REAL adapter's stream()
+# parses the mock's REAL streaming HTTP response, in-process, no Docker.
+
+_TOOL_DEF = {
+    "name": "get_weather",
+    "description": "Get the current weather for a city.",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+}
+
+
+def _tool_request(model: str) -> UnifiedChatRequest:
+    from app.core.schema import ToolDefinition
+
+    return UnifiedChatRequest(
+        model=model,
+        messages=[ChatMessage(role="user", content="weather in Pune?")],
+        tools=[ToolDefinition(**_TOOL_DEF)],
+        stream=True,
+        max_tokens=64,
+    )
+
+
+async def test_openai_adapter_streams_a_tool_call_against_the_mock(monkeypatch):
+    _patch_transport(monkeypatch, "app.providers.openai_adapter")
+    adapter = OpenAIAdapter(api_key="unused", base_url="http://mockhost/openai")
+    request = _tool_request("openai:mock-gpt")
+
+    payload = adapter.translate_request(request, provider_model="mock-gpt")
+    chunks = [c async for c in adapter.stream(payload, request=request, provider_model="mock-gpt")]
+
+    tool_chunks = [c for c in chunks if c.tool_call_deltas]
+    assert tool_chunks, "expected at least one tool_call_deltas-bearing chunk"
+    assert tool_chunks[0].tool_call_deltas[0].name == "get_weather"
+    arguments = "".join(
+        d.arguments_delta for c in chunks for d in (c.tool_call_deltas or [])
+    )
+    assert arguments == '{"city": "Pune"}'
+    assert chunks[-1].finish_reason == "tool_calls"
+
+
+async def test_anthropic_adapter_streams_a_tool_call_against_the_mock(monkeypatch):
+    _patch_transport(monkeypatch, "app.providers.anthropic_adapter")
+    adapter = AnthropicAdapter(api_key="unused", base_url="http://mockhost/anthropic")
+    request = _tool_request("anthropic:mock-claude")
+
+    payload = adapter.translate_request(request, provider_model="mock-claude")
+    chunks = [c async for c in adapter.stream(payload, request=request, provider_model="mock-claude")]
+
+    tool_chunks = [c for c in chunks if c.tool_call_deltas]
+    assert tool_chunks
+    assert tool_chunks[0].tool_call_deltas[0].name == "get_weather"
+    arguments = "".join(
+        d.arguments_delta for c in chunks for d in (c.tool_call_deltas or [])
+    )
+    assert arguments == '{"city": "Pune"}'
+    assert chunks[-1].finish_reason == "tool_calls"
+
+
+async def test_ollama_adapter_streams_a_tool_call_against_the_mock(monkeypatch):
+    _patch_transport(monkeypatch, "app.providers.ollama_adapter")
+    adapter = OllamaAdapter(base_url="http://mockhost/ollama")
+    request = _tool_request("ollama:mock-llama")
+
+    payload = adapter.translate_request(request, provider_model="mock-llama")
+    chunks = [c async for c in adapter.stream(payload, request=request, provider_model="mock-llama")]
+
+    tool_chunks = [c for c in chunks if c.tool_call_deltas]
+    assert tool_chunks
+    assert tool_chunks[0].tool_call_deltas[0].name == "get_weather"
+    # Ollama hands over the whole argument string in one delta -- see
+    # docs/PHASE8B_KICKOFF_SCOPING.md §0 finding 3.
+    assert len(tool_chunks[0].tool_call_deltas[0].arguments_delta) > 0
+    assert chunks[-1].finish_reason == "tool_calls"
+
+
+async def test_mock_streaming_without_tools_is_unaffected_by_the_new_branch(monkeypatch):
+    """Regression guard: a plain (no-tools) streaming request must still
+    get the original plain-text mock stream, proving the new branch is
+    genuinely additive, not a behavior change for the 10 pre-existing
+    wire-compat tests above."""
+    _patch_transport(monkeypatch, "app.providers.openai_adapter")
+    adapter = OpenAIAdapter(api_key="unused", base_url="http://mockhost/openai")
+    request = _request("openai:mock-gpt")
+    request.stream = True
+
+    payload = adapter.translate_request(request, provider_model="mock-gpt")
+    chunks = [c async for c in adapter.stream(payload, request=request, provider_model="mock-gpt")]
+
+    assert all(c.tool_call_deltas is None for c in chunks)
+    assert "".join(c.delta for c in chunks) == "This is a mock response."

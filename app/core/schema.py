@@ -85,6 +85,47 @@ class ToolCall(BaseModel):
     arguments: str = "{}"
 
 
+class ToolCallDelta(BaseModel):
+    """
+    Phase 8b: one incremental update to one in-progress tool call within a
+    streaming response (docs/PHASE8B_KICKOFF_SCOPING.md §2.1).
+
+    `index` is a stable per-call correlation key for THIS response only,
+    not a global id — every provider's own streaming protocol already
+    gives us one (OpenAI's `output_index`, Anthropic's `content_block`
+    index), so the gateway reuses it directly rather than renumbering. It
+    is not guaranteed contiguous or zero-based when a response also
+    contains ordinary text output items interleaved with function calls
+    (OpenAI's `output_index` spans every output item type, not just tool
+    calls).
+
+    `id`/`name` are populated ONLY on the first delta emitted for a given
+    index — every later delta for that index carries `arguments_delta`
+    only and leaves both None. This mirrors OpenAI's own client-side
+    accumulation convention almost exactly (the same "index" concept, the
+    same declare-once-then-stream-body shape), deliberately, so this
+    gateway's wire contract is familiar to anyone who has already built a
+    client against OpenAI-style streaming tool calls.
+
+    `arguments_delta` is always a JSON-string FRAGMENT to append to
+    whatever has already been accumulated for this index — true even for
+    a provider (Ollama) that hands over the complete arguments in one
+    chunk: that case just means index N receives exactly one non-empty
+    delta instead of several. No consumer of this stream — the gateway's
+    own fallback-cutoff check in app/resilience/fallback.py, or an
+    external client — ever has to branch on which provider is serving the
+    request to know how to accumulate: group deltas by `index`, keep the
+    first `id`/`name` seen for that index, concatenate `arguments_delta`
+    in arrival order, and once a chunk with `finish_reason == "tool_calls"`
+    arrives every accumulated index is one complete tool call.
+    """
+
+    index: int
+    id: str | None = None
+    name: str | None = None
+    arguments_delta: str = ""
+
+
 class ChatMessage(BaseModel):
     """
     One turn in the conversation.
@@ -199,23 +240,23 @@ class UnifiedChatRequest(BaseModel):
             raise ValueError("stop supports at most 4 sequences")
         return v
 
-    @model_validator(mode="after")
-    def _tools_not_yet_supported_with_streaming(self) -> UnifiedChatRequest:
-        # Phase 8 ships non-streaming tool calling only (explicit developer
-        # sign-off, docs/PHASE8_KICKOFF_SCOPING.md §5/§9 Q1) — every
-        # provider's streaming tool-call event shape is different and
-        # non-trivial, and silently DROPPING tool-call info out of a
-        # stream (rather than erroring) would be worse than refusing the
-        # combination outright. Rejected here, once, at the schema
-        # boundary — a clean 422 with a self-explanatory reason — rather
-        # than as a per-adapter silent gap four different ways.
-        if self.stream and self.tools:
-            raise ValueError(
-                "tools + stream=true is not supported yet (Phase 8 ships non-streaming "
-                "tool calling only — see docs/PHASE8_KICKOFF_SCOPING.md §5); retry "
-                "without stream, or without tools."
-            )
-        return self
+    # Phase 8b (docs/PHASE8B_KICKOFF_SCOPING.md §2.2): the Phase 8
+    # schema-level `tools + stream=True` rejection is REMOVED, not
+    # relaxed. Teaching the schema layer which providers currently
+    # support streaming tool calls is impossible to do correctly here:
+    # `model` may be a tier name ("tier-1-reasoning") resolved into a
+    # provider chain later in the pipeline, so this layer cannot know at
+    # construction time whether the eventual provider will support the
+    # combination. Capability enforcement now lives exactly where every
+    # other per-provider capability gap in this codebase already lives —
+    # the adapter itself. GeminiAdapter.stream() already unconditionally
+    # raises ProviderError(501, "unsupported_streaming") for ANY
+    # streaming attempt, tools or not — that single existing line is
+    # also correct and sufficient tool-call-streaming capability
+    # enforcement for Gemini, and the existing fallback/retry chain-walk
+    # machinery already knows what to do with a ProviderError from one
+    # link (retry if retryable, advance to the next chain link, or
+    # bubble up if it's the terminal one) — see app/resilience/fallback.py.
 
 
 class Usage(BaseModel):
@@ -268,3 +309,9 @@ class UnifiedStreamChunk(BaseModel):
     delta: str = ""
     finish_reason: FinishReason = None
     usage: Usage | None = None
+    # Phase 8b: populated only on a chunk carrying tool-call argument
+    # fragments — see ToolCallDelta's own docstring for the accumulation
+    # contract. None (not an empty list) whenever this chunk carries no
+    # tool-call data, matching `usage`'s existing "None means absent"
+    # convention on this same model.
+    tool_call_deltas: list[ToolCallDelta] | None = None

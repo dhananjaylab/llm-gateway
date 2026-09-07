@@ -67,6 +67,7 @@ from app.core.schema import (
     ChatMessage,
     ForcedToolChoice,
     ToolCall,
+    ToolCallDelta,
     UnifiedChatRequest,
     UnifiedChatResponse,
     UnifiedChoice,
@@ -262,17 +263,43 @@ class OpenAIAdapter(ProviderAdapter):
         """Stream a Responses API SSE response, yielding normalized chunks.
 
         The Responses API uses named SSE events:
-          event: response.output_text.delta   → content delta
-          event: response.completed           → terminal usage
-          event: error                        → ProviderError
+          event: response.output_text.delta            → content delta
+          event: response.output_item.added             → declares a new output item;
+                                                            for a function_call item, records
+                                                            its call_id/name (Phase 8b)
+          event: response.function_call_arguments.delta → tool-call argument JSON-string
+                                                            fragment (Phase 8b)
+          event: response.completed                     → terminal usage; finish_reason is
+                                                            "tool_calls" if any function_call
+                                                            item was seen this stream, else
+                                                            "stop" (Phase 8b)
+          event: error                                   → ProviderError
 
         Each SSE block is a sequence of "field: value" lines followed by a
         blank line.  We accumulate the event name and data across lines and
         dispatch when the block ends.
+
+        Phase 8b (docs/PHASE8B_KICKOFF_SCOPING.md §3.1): `pending` maps
+        OpenAI's own `output_index` (shared across every output item type,
+        not just function calls — not necessarily contiguous among tool
+        calls alone) to the (call_id, name) declared by
+        `response.output_item.added`, and `declared` tracks which indices
+        have already emitted their first delta — id/name ride along on
+        that first delta only, per ToolCallDelta's own "declare once"
+        contract, never as a separate empty chunk.
+        `response.function_call_arguments.done` is deliberately NOT
+        consumed as a second source of truth: concatenating the `.delta`
+        fragments already reconstructs the identical string, and treating
+        `.delta` as the sole source keeps this method free of any
+        argument-string buffering beyond the `pending`/`declared` index
+        bookkeeping it needs regardless.
         """
         url = f"{self._base_url}/v1/responses"
         headers = {"Authorization": f"Bearer {self._api_key}"}
         chunk_id = f"gw-{uuid.uuid4().hex[:24]}"
+        pending: dict[int, tuple[str, str]] = {}
+        declared: set[int] = set()
+        saw_tool_calls = False
 
         try:
             async with self._client.stream("POST", url, json=payload, headers=headers) as resp:
@@ -307,6 +334,32 @@ class OpenAIAdapter(ProviderAdapter):
                                     delta=event_data.get("delta", ""),
                                 )
 
+                            elif event_name == "response.output_item.added":
+                                item = event_data.get("item") or {}
+                                if item.get("type") == "function_call":
+                                    idx = event_data.get("output_index", 0)
+                                    pending[idx] = (item.get("call_id", ""), item.get("name", ""))
+                                    saw_tool_calls = True
+
+                            elif event_name == "response.function_call_arguments.delta":
+                                idx = event_data.get("output_index", 0)
+                                first_delta_for_index = idx not in declared
+                                declared.add(idx)
+                                call_id, call_name = pending.get(idx, ("", ""))
+                                yield UnifiedStreamChunk(
+                                    id=chunk_id,
+                                    provider=self.provider_name,
+                                    model_served=provider_model,
+                                    tool_call_deltas=[
+                                        ToolCallDelta(
+                                            index=idx,
+                                            id=call_id if first_delta_for_index else None,
+                                            name=call_name if first_delta_for_index else None,
+                                            arguments_delta=event_data.get("delta", ""),
+                                        )
+                                    ],
+                                )
+
                             elif event_name == "response.completed":
                                 response_obj = event_data.get("response") or {}
                                 usage_raw = response_obj.get("usage") or {}
@@ -319,7 +372,7 @@ class OpenAIAdapter(ProviderAdapter):
                                     provider=self.provider_name,
                                     model_served=served_model,
                                     delta="",
-                                    finish_reason="stop",
+                                    finish_reason="tool_calls" if saw_tool_calls else "stop",
                                     usage=Usage(
                                         input_tokens=usage_raw.get("input_tokens", 0),
                                         output_tokens=usage_raw.get("output_tokens", 0),

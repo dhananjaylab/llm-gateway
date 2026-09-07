@@ -63,6 +63,7 @@ import httpx
 from app.core.schema import (
     ChatMessage,
     ToolCall,
+    ToolCallDelta,
     UnifiedChatRequest,
     UnifiedChatResponse,
     UnifiedChoice,
@@ -236,8 +237,38 @@ class OllamaAdapter(ProviderAdapter):
     async def stream(
         self, payload: dict, *, request: UnifiedChatRequest, provider_model: str
     ) -> AsyncIterator[UnifiedStreamChunk]:
+        """
+        Phase 8b (docs/PHASE8B_KICKOFF_SCOPING.md §3.3): unlike OpenAI/
+        Anthropic, Ollama hands over a tool call's arguments as a COMPLETE
+        parsed object on whichever chunk carries `message.tool_calls`, not
+        as incremental JSON-string fragments — confirmed against Ollama's
+        own streaming docs. This reuses `_extract_tool_calls()`
+        UNCHANGED (the exact same helper the non-streaming path already
+        uses, synthesized `gwsyn_{index}` ids and all) and re-emits each
+        result as a single ToolCallDelta whose `arguments_delta` happens
+        to be the whole argument string at once — no follow-up deltas
+        will arrive for that index, which is simply the "one delta total"
+        case of the same general contract OpenAI/Anthropic's multi-delta
+        streams also satisfy.
+
+        `index` here is scoped to POSITION WITHIN THE CHUNK that carried
+        it (same enumeration `_extract_tool_calls()` already does for the
+        non-streaming path) — Ollama's docs don't explicitly confirm
+        whether a multi-tool-call response could ever split its calls
+        across more than one chunk; if it can, this would need a
+        cross-chunk running index instead. Flagged for a live-instance
+        recheck at build/deploy time (docs/PHASE8B_KICKOFF_SCOPING.md §8
+        Q3), same "verify before a real demo" posture Phase 8 already
+        used for this adapter's `format` field.
+
+        `saw_tool_calls` is tracked across the WHOLE stream, not read off
+        only the terminal `done: true` line — an earlier chunk may carry
+        the tool call(s) with a later, separate chunk being the one that
+        finally sets `done`.
+        """
         url = f"{self._base_url}/api/chat"
         chunk_id = f"gw-{uuid.uuid4().hex[:24]}"
+        saw_tool_calls = False
 
         try:
             async with self._client.stream(
@@ -252,6 +283,23 @@ class OllamaAdapter(ProviderAdapter):
                         continue
                     event = json.loads(line)
                     served_model = event.get("model", provider_model)
+                    message = event.get("message") or {}
+
+                    raw_tool_calls = message.get("tool_calls")
+                    if raw_tool_calls:
+                        saw_tool_calls = True
+                        calls = _extract_tool_calls(raw_tool_calls)
+                        yield UnifiedStreamChunk(
+                            id=chunk_id,
+                            provider=self.provider_name,
+                            model_served=served_model,
+                            tool_call_deltas=[
+                                ToolCallDelta(
+                                    index=i, id=call.id, name=call.name, arguments_delta=call.arguments
+                                )
+                                for i, call in enumerate(calls)
+                            ],
+                        )
 
                     if event.get("done"):
                         yield UnifiedStreamChunk(
@@ -259,7 +307,7 @@ class OllamaAdapter(ProviderAdapter):
                             provider=self.provider_name,
                             model_served=served_model,
                             delta="",
-                            finish_reason="stop",
+                            finish_reason="tool_calls" if saw_tool_calls else "stop",
                             usage=Usage(
                                 input_tokens=event.get("prompt_eval_count", 0),
                                 output_tokens=event.get("eval_count", 0),
@@ -267,7 +315,7 @@ class OllamaAdapter(ProviderAdapter):
                         )
                         break
 
-                    delta_text = event.get("message", {}).get("content", "")
+                    delta_text = message.get("content", "")
                     if delta_text:
                         yield UnifiedStreamChunk(
                             id=chunk_id,

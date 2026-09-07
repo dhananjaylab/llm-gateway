@@ -13,6 +13,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from app.core import config as config_module
 from app.core.schema import (
     ChatMessage,
+    ToolCallDelta,
     UnifiedChatRequest,
     UnifiedChatResponse,
     UnifiedChoice,
@@ -172,6 +173,18 @@ class FakeAdapter(ProviderAdapter):
       exhaust whole fallback chains deterministically.
     - `latency_seconds`: injected `asyncio.sleep()` before responding, so
       health-check P99-latency tests don't need a real slow server.
+
+    Phase 8b addition:
+    - `tool_call_chunks`: an optional `list[list[ToolCallDelta]]` — each
+      inner list becomes one streamed chunk's `tool_call_deltas`, yielded
+      after any `stream_chunks` text. When set, the terminal chunk's
+      `finish_reason` becomes `"tool_calls"` instead of `"stop"`,
+      matching every real adapter's own priority rule. Lets fallback/
+      billing/SSE-passthrough tests exercise the full HTTP pipeline with
+      genuine `tool_call_deltas` content without needing a real provider
+      or a MockTransport-mocked SSE body — those still exist separately
+      in tests/unit/test_streaming_tool_calls.py for testing each real
+      adapter's own wire-format parsing.
     """
 
     provider_name = "fake"
@@ -181,6 +194,7 @@ class FakeAdapter(ProviderAdapter):
         *,
         response_text: str = "hello from fake adapter",
         stream_chunks: list[str] | None = None,
+        tool_call_chunks: list[list[ToolCallDelta]] | None = None,
         usage_override: Usage | None = None,
         fail_times: int = 0,
         always_fail: bool = False,
@@ -190,7 +204,15 @@ class FakeAdapter(ProviderAdapter):
         latency_seconds: float = 0.0,
     ) -> None:
         self.response_text = response_text
-        self.stream_chunks = stream_chunks or ["Hel", "lo", "!"]
+        # Phase 8b fix: `stream_chunks or [...]` treated an intentionally
+        # empty list the same as "not provided" and silently fell back to
+        # the default three text chunks — never triggered before this
+        # phase, since every prior caller passed either None or a
+        # non-empty list, but it would have broken a
+        # tool-calls-only-no-text fake stream. `is not None` is the
+        # correct check; behavior for every existing caller is unchanged.
+        self.stream_chunks = stream_chunks if stream_chunks is not None else ["Hel", "lo", "!"]
+        self.tool_call_chunks = tool_call_chunks
         self.usage_override = usage_override
         self.last_translated_request: UnifiedChatRequest | None = None
         self.call_count = 0
@@ -260,6 +282,15 @@ class FakeAdapter(ProviderAdapter):
                     model_served=provider_model,
                     delta=text,
                 )
+            if self.tool_call_chunks:
+                for deltas in self.tool_call_chunks:
+                    self.yielded_count += 1
+                    yield UnifiedStreamChunk(
+                        id="fake-stream-1",
+                        provider=self.provider_name,
+                        model_served=provider_model,
+                        tool_call_deltas=deltas,
+                    )
             usage = self.usage_override or Usage(
                 input_tokens=10, output_tokens=len(self.stream_chunks)
             )
@@ -268,7 +299,7 @@ class FakeAdapter(ProviderAdapter):
                 provider=self.provider_name,
                 model_served=provider_model,
                 delta="",
-                finish_reason="stop",
+                finish_reason="tool_calls" if self.tool_call_chunks else "stop",
                 usage=usage,
             )
         finally:

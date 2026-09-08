@@ -66,6 +66,7 @@ from app.core.schema import (
     ChatMessage,
     ForcedToolChoice,
     ToolCall,
+    ToolCallDelta,
     UnifiedChatRequest,
     UnifiedChatResponse,
     UnifiedChoice,
@@ -292,10 +293,32 @@ class AnthropicAdapter(ProviderAdapter):
     async def stream(
         self, payload: dict, *, request: UnifiedChatRequest, provider_model: str
     ) -> AsyncIterator[UnifiedStreamChunk]:
+        """
+        Phase 8b (docs/PHASE8B_KICKOFF_SCOPING.md §3.2): a `tool_use`
+        content block is declared by `content_block_start` (carries `id`/
+        `name`, no argument text yet — this event type was previously
+        unhandled entirely, since Phase 1-8's streaming path never needed
+        anything from it) and its arguments arrive as `content_block_delta`
+        events of type `input_json_delta` (`delta.partial_json`, a JSON-
+        string FRAGMENT, not a token). `pending`/`declared` mirror
+        OpenAIAdapter.stream()'s own bookkeeping exactly: id/name ride
+        along on the first `input_json_delta` seen for a given
+        `content_block` index only, per ToolCallDelta's "declare once"
+        contract, never as a separate empty chunk. A response can freely
+        interleave a `text` block and one or more `tool_use` blocks at
+        different indices — both are handled in the same
+        `content_block_delta` branch, keyed on `delta.type`.
+        `message_delta.delta.stop_reason == "tool_use"` already maps to
+        `finish_reason = "tool_calls"` via `_map_stop_reason` (extended in
+        Phase 8 for the non-streaming path) — no new mapping needed here,
+        only the fact that this loop already calls it.
+        """
         url = f"{self._base_url}/v1/messages"
         message_id = None
         served_model = provider_model
         input_tokens = 0
+        pending: dict[int, tuple[str, str]] = {}
+        declared: set[int] = set()
 
         try:
             async with self._client.stream(
@@ -323,6 +346,12 @@ class AnthropicAdapter(ProviderAdapter):
                         served_model = message.get("model", served_model)
                         input_tokens = (message.get("usage") or {}).get("input_tokens", 0)
 
+                    elif event_type == "content_block_start":
+                        block = data.get("content_block") or {}
+                        if block.get("type") == "tool_use":
+                            index = data.get("index", 0)
+                            pending[index] = (block.get("id", ""), block.get("name", ""))
+
                     elif event_type == "content_block_delta":
                         delta = data.get("delta", {})
                         if delta.get("type") == "text_delta":
@@ -331,6 +360,24 @@ class AnthropicAdapter(ProviderAdapter):
                                 provider=self.provider_name,
                                 model_served=served_model,
                                 delta=delta.get("text", ""),
+                            )
+                        elif delta.get("type") == "input_json_delta":
+                            index = data.get("index", 0)
+                            first_delta_for_index = index not in declared
+                            declared.add(index)
+                            call_id, call_name = pending.get(index, ("", ""))
+                            yield UnifiedStreamChunk(
+                                id=message_id or UnifiedChatResponse.new_id(),
+                                provider=self.provider_name,
+                                model_served=served_model,
+                                tool_call_deltas=[
+                                    ToolCallDelta(
+                                        index=index,
+                                        id=call_id if first_delta_for_index else None,
+                                        name=call_name if first_delta_for_index else None,
+                                        arguments_delta=delta.get("partial_json", ""),
+                                    )
+                                ],
                             )
 
                     elif event_type == "message_delta":

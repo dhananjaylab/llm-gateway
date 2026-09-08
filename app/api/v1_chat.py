@@ -601,6 +601,14 @@ async def _stream_response(
     short (disconnect or mid-stream provider failure), there's a
     best-effort record of exactly what the client received to estimate
     output tokens from, instead of the old "assume zero" behavior.
+
+    Phase 8b: `accumulated_text` also absorbs streamed tool-call argument
+    fragments (`chunk.tool_call_deltas[].arguments_delta`), not just plain
+    text `chunk.delta` — a disconnect or mid-stream failure while a tool
+    call's arguments are still accumulating is real generated output the
+    same way partial text is, and should feed the same best-effort
+    output-token estimate rather than silently under-billing to zero for
+    the tool-call portion.
     """
     start = time.perf_counter()
     first_chunk_logged = False
@@ -648,6 +656,16 @@ async def _stream_response(
                 final_usage = chunk.usage
             if chunk.delta:
                 accumulated_text += chunk.delta
+            # Phase 8b (docs/PHASE8B_KICKOFF_SCOPING.md §4): tool-call
+            # argument fragments are real generated output too — folding
+            # them into the same accumulated_text the char-ratio/tiktoken
+            # heuristic in output_tokenizer.py already estimates from
+            # closes the same class of financial-leakage gap Phase 7 fixed
+            # for plain text, for a disconnect or mid-stream failure that
+            # happens while a tool call's arguments are still streaming.
+            if chunk.tool_call_deltas:
+                for tool_delta in chunk.tool_call_deltas:
+                    accumulated_text += tool_delta.arguments_delta
 
             yield f"data: {chunk.model_dump_json()}\n\n"
     except (ProviderError, FallbackExhaustedError) as exc:

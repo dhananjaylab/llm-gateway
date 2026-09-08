@@ -260,6 +260,9 @@ class GatewaySettings(BaseModel):
     """
 
     redis_url: str = "redis://localhost:6379/0"
+    redis_socket_timeout_seconds: float = 5.0
+    redis_socket_connect_timeout_seconds: float = 5.0
+    redis_max_connections: int = 50
     gateway_admin_key: str | None = None
 
     rate_limit_fail_open: bool = True

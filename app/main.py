@@ -46,8 +46,10 @@ from app.core.audit import AuditLog
 from app.core.config import get_gateway_settings, load_orgs_config, load_teams_config, load_tiers_config
 from app.core.org_store import OrgConfigStore
 from app.core.pricing import load_pricing
+from app.core.pricing_store import PricingStore
 from app.core.redis_client import build_redis_client
 from app.core.team_store import TeamConfigStore
+from app.core.tiers_store import TiersConfigStore
 from app.observability.metrics import build_metrics
 from app.observability.tracing import init_tracing
 from app.providers.registry import all_configured_provider_models, close_all_adapters, resolve_model
@@ -82,6 +84,40 @@ async def _listen_for_store_changes(app: FastAPI, *, channel: str, invalidate) -
             entity_id = message["data"]
             invalidate(entity_id)
             logger.debug("config-change event on %s: invalidated cache for %s", channel, entity_id)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await pubsub.unsubscribe(channel)
+        await pubsub.aclose()
+
+
+async def _listen_for_full_refresh(app: FastAPI, *, channel: str, refresh_fn) -> None:
+    """
+    Phase 9a counterpart to `_listen_for_store_changes` above, for stores
+    that keep the WHOLE table resident in memory (`TiersConfigStore`,
+    `PricingStore` — see those modules' docstrings for why) rather than a
+    per-key cache. On any change event, regardless of which single key
+    changed, the listener just re-reads the entire table via `refresh_fn()`
+    — cheap at this table's size (a handful of tiers/pricing rows) and
+    keeps both stores simple, avoiding a second, per-key-diff code path.
+
+    Deliberately a NEW, separate helper rather than extending
+    `_listen_for_store_changes` itself: that helper's `invalidate` callback
+    is called synchronously, without `await` (TeamConfigStore.invalidate /
+    OrgConfigStore.invalidate are plain sync methods) — `refresh_fn` here
+    has to be awaited (it reads Redis to rebuild the in-memory table), and
+    changing the existing helper's contract would touch two already-tested,
+    already-locked-down call sites for no benefit to them.
+    """
+    redis: Redis = app.state.redis
+    pubsub = redis.pubsub()
+    await pubsub.subscribe(channel)
+    try:
+        async for message in pubsub.listen():
+            if message.get("type") != "message":
+                continue
+            await refresh_fn()
+            logger.debug("config-change event on %s: refreshed full table", channel)
     except asyncio.CancelledError:
         pass
     finally:
@@ -143,9 +179,37 @@ def _build_lifespan(redis_client_override: Redis | None):
         )
         app.state.audit_log = AuditLog(redis_client)
         app.state.pricing = load_pricing(settings.pricing_path)
+        # Phase 9a: hot-reload for $ pricing (docs/PHASE9A_IMPLEMENTATION_GUIDE.md).
+        # `table=app.state.pricing` — PricingStore.refresh() mutates THIS
+        # exact dict object in place; it is never reassigned. See that
+        # module's docstring for why FallbackRouter's own captured
+        # `self._pricing_table` reference depends on that distinction.
+        app.state.pricing_store = PricingStore(redis_client, table=app.state.pricing)
+        seeded_pricing = await app.state.pricing_store.seed_from_yaml_if_empty(
+            load_pricing(settings.pricing_path)
+        )
+        if seeded_pricing:
+            logger.info(
+                "bootstrap-seeded %d pricing row(s) into Redis from config/pricing.yaml", seeded_pricing
+            )
+        # Always refresh, even when nothing was just seeded (e.g. Redis
+        # already had rows written by a PATCH from another instance before
+        # this one booted) — Redis, not the YAML file, is the runtime
+        # source of truth from here on, same rule teams/orgs already follow.
+        await app.state.pricing_store.refresh()
 
         # -- Phase 3: resilience layer --------------------------------------
         app.state.tiers_config = load_tiers_config(settings.tiers_path)
+        # Phase 9a: hot-reload for tier -> fallback-chain config. Same RCU
+        # pattern as pricing above — see app/core/tiers_store.py's docstring.
+        # Constructed and refreshed BEFORE `FallbackRouter` below so the
+        # object it's handed is already Redis-authoritative, not the raw
+        # YAML snapshot, from the very first request.
+        app.state.tiers_store = TiersConfigStore(redis_client, tiers_config=app.state.tiers_config)
+        seeded_tiers = await app.state.tiers_store.seed_from_yaml_if_empty(app.state.tiers_config)
+        if seeded_tiers:
+            logger.info("bootstrap-seeded %d tier(s) into Redis from config/tiers.yaml", seeded_tiers)
+        await app.state.tiers_store.refresh()
 
         app.state.circuit_breaker = CircuitBreaker(
             redis_client,
@@ -201,6 +265,18 @@ def _build_lifespan(redis_client_override: Redis | None):
                 app, channel=OrgConfigStore.CONFIG_CHANGE_CHANNEL, invalidate=app.state.org_store.invalidate
             )
         )
+        # Phase 9a: full-table-refresh listeners (see _listen_for_full_refresh's
+        # own docstring for why these are a separate helper from the two above).
+        tiers_listener_task = asyncio.create_task(
+            _listen_for_full_refresh(
+                app, channel=TiersConfigStore.CONFIG_CHANGE_CHANNEL, refresh_fn=app.state.tiers_store.refresh
+            )
+        )
+        pricing_listener_task = asyncio.create_task(
+            _listen_for_full_refresh(
+                app, channel=PricingStore.CONFIG_CHANGE_CHANNEL, refresh_fn=app.state.pricing_store.refresh
+            )
+        )
 
         health_checker_task: asyncio.Task | None = None
         if settings.health_check_enabled:
@@ -230,6 +306,12 @@ def _build_lifespan(redis_client_override: Redis | None):
             org_listener_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await org_listener_task
+            tiers_listener_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await tiers_listener_task
+            pricing_listener_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pricing_listener_task
             if health_checker_task is not None:
                 health_checker_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

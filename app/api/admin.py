@@ -317,6 +317,147 @@ async def patch_org(
     return await _org_view(org_id, after, request)
 
 
+# -- Phase 9a: tiers + pricing hot-reload -----------------------------------
+#
+# Same "PATCH only mutates an existing row" contract as every other config
+# surface above: adding a brand-new tier or model_key still needs a
+# config/tiers.yaml or config/pricing.yaml edit + a fresh Redis. See
+# app/core/tiers_store.py / pricing_store.py for the RCU hot-reload
+# mechanics these routes trigger — the interesting design decisions live
+# there, not here; these routes are deliberately the same shape as
+# /admin/limits, /admin/budgets, /admin/orgs.
+
+
+class TierView(BaseModel):
+    tier_name: str
+    chain: list[str]
+
+
+class TierPatch(BaseModel):
+    chain: list[str] = Field(..., min_length=1)
+
+
+@router.get("/tiers", response_model=list[str])
+async def list_tiers(request: Request, actor: str = Depends(require_admin)) -> list[str]:
+    return await request.app.state.tiers_store.all_tier_names()
+
+
+@router.get("/tiers/{tier_name}", response_model=TierView)
+async def get_tier(tier_name: str, request: Request, actor: str = Depends(require_admin)) -> TierView:
+    chain = request.app.state.tiers_config.chain_for(tier_name)
+    if chain is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"error": {"type": "tier_not_found"}})
+    return TierView(tier_name=tier_name, chain=chain)
+
+
+@router.patch("/tiers/{tier_name}", response_model=TierView)
+async def patch_tier(
+    tier_name: str, patch: TierPatch, request: Request, actor: str = Depends(require_admin)
+) -> TierView:
+    tiers_config = request.app.state.tiers_config
+    before = tiers_config.chain_for(tier_name)
+    if before is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"error": {"type": "tier_not_found"}})
+
+    try:
+        after = await request.app.state.tiers_store.update_tier(tier_name, patch.chain)
+    except KeyError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"error": {"type": "tier_not_found"}}) from exc
+
+    await request.app.state.audit_log.record(
+        actor=actor,
+        action="patch_tier",
+        team_id=tier_name,  # AuditLog's schema is (actor, action, team_id, before, after) — reused
+        # for a tier_name here, same precedent as /admin/orgs reusing it for
+        # an org_id (see patch_org above); /admin/audit entries are already
+        # disambiguated by `action`.
+        before={"chain": before},
+        after={"chain": after},
+    )
+    return TierView(tier_name=tier_name, chain=after)
+
+
+class PricingView(BaseModel):
+    model_key: str
+    input_per_million: float
+    output_per_million: float
+    cache_read_per_million: float | None = None
+    cache_write_per_million: float | None = None
+
+
+class PricingPatch(BaseModel):
+    input_per_million: float | None = Field(default=None, ge=0)
+    output_per_million: float | None = Field(default=None, ge=0)
+    cache_read_per_million: float | None = Field(default=None, ge=0)
+    cache_write_per_million: float | None = Field(default=None, ge=0)
+
+
+@router.get("/pricing", response_model=list[str])
+async def list_pricing(request: Request, actor: str = Depends(require_admin)) -> list[str]:
+    return await request.app.state.pricing_store.all_model_keys()
+
+
+@router.get("/pricing/{model_key}", response_model=PricingView)
+async def get_pricing(model_key: str, request: Request, actor: str = Depends(require_admin)) -> PricingView:
+    entry = request.app.state.pricing.get(model_key)
+    if entry is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"error": {"type": "pricing_not_found"}})
+    return PricingView(
+        model_key=model_key,
+        input_per_million=entry.input_per_million,
+        output_per_million=entry.output_per_million,
+        cache_read_per_million=entry.cache_read_per_million,
+        cache_write_per_million=entry.cache_write_per_million,
+    )
+
+
+@router.patch("/pricing/{model_key}", response_model=PricingView)
+async def patch_pricing(
+    model_key: str, patch: PricingPatch, request: Request, actor: str = Depends(require_admin)
+) -> PricingView:
+    before = request.app.state.pricing.get(model_key)
+    if before is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"error": {"type": "pricing_not_found"}})
+
+    changes = patch.model_dump(exclude_none=True)
+    if not changes:
+        return PricingView(
+            model_key=model_key,
+            input_per_million=before.input_per_million,
+            output_per_million=before.output_per_million,
+            cache_read_per_million=before.cache_read_per_million,
+            cache_write_per_million=before.cache_write_per_million,
+        )
+
+    try:
+        after = await request.app.state.pricing_store.update_pricing(model_key, changes)
+    except KeyError as exc:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, detail={"error": {"type": "pricing_not_found"}}
+        ) from exc
+
+    await request.app.state.audit_log.record(
+        actor=actor,
+        action="patch_pricing",
+        team_id=model_key,
+        before={
+            "input_per_million": before.input_per_million,
+            "output_per_million": before.output_per_million,
+        },
+        after={
+            "input_per_million": after.input_per_million,
+            "output_per_million": after.output_per_million,
+        },
+    )
+    return PricingView(
+        model_key=model_key,
+        input_per_million=after.input_per_million,
+        output_per_million=after.output_per_million,
+        cache_read_per_million=after.cache_read_per_million,
+        cache_write_per_million=after.cache_write_per_million,
+    )
+
+
 # -- Phase 3: health + circuits (read-only, ahead of Phase 4 Grafana) --------
 
 

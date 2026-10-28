@@ -1,13 +1,13 @@
 fastapi[standard]>=0.141.1,<0.142
-uvicorn[standard]>=0.53.0,<0.54
+uvicorn[standard]>=0.54.0,<0.55
 pydantic>=2.13.5,<3
 httpx>=0.28.1,<0.29
 pyyaml>=6.0.3,<7
 python-dotenv>=1.2.4,<2
 redis>=8.1,<9
-opentelemetry-sdk>=1.44,<1.45
-opentelemetry-exporter-otlp-proto-http>=1.45.1,<1.46
-opentelemetry-instrumentation-fastapi>=0.65b0,<0.66
+opentelemetry-sdk>=1.45.1,<1.46
+opentelemetry-exporter-otlp-proto-http>=1.45.0,<1.46
+opentelemetry-instrumentation-fastapi>=0.66b1,<0.66
 prometheus-client>=0.26,<0.27
 pytest>=9.1.1,<10
 pytest-asyncio>=1.4.0,<1.5

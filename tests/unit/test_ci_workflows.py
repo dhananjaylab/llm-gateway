@@ -42,6 +42,16 @@ _KEEP_AS_STRING = {"on", "On", "ON", "off", "Off", "OFF"}
 
 
 def _bool_constructor(loader: yaml.SafeLoader, node: yaml.ScalarNode):
+    """
+    Convert YAML boolean literals to Python booleans while preserving configured values as strings.
+    
+    Parameters:
+    	loader (yaml.SafeLoader): YAML loader constructing the scalar value.
+    	node (yaml.ScalarNode): Scalar node to convert.
+    
+    Returns:
+    	The preserved string or corresponding Python boolean value.
+    """
     value = loader.construct_scalar(node)
     if value in _KEEP_AS_STRING:
         return value
@@ -56,18 +66,39 @@ _WorkflowSafeLoader.add_constructor("tag:yaml.org,2002:bool", _bool_constructor)
 
 
 def _load(path: Path) -> dict:
+    """
+    Load a workflow YAML file into a dictionary.
+    
+    Parameters:
+    	path (Path): Path to the YAML workflow file.
+    
+    Returns:
+    	dict: Parsed workflow configuration.
+    """
     with open(path, encoding="utf-8") as f:
         return yaml.load(f, Loader=_WorkflowSafeLoader)
 
 
 @pytest.fixture(scope="module")
 def ci_doc() -> dict:
+    """
+    Load the CI workflow configuration.
+    
+    Returns:
+    	dict: The parsed contents of the CI workflow file.
+    """
     assert (_WORKFLOWS_DIR / "ci.yml").exists()
     return _load(_WORKFLOWS_DIR / "ci.yml")
 
 
 @pytest.fixture(scope="module")
 def integration_doc() -> dict:
+    """
+    Load and parse the integration workflow configuration.
+    
+    Returns:
+        dict: The parsed contents of integration.yml.
+    """
     assert (_WORKFLOWS_DIR / "integration.yml").exists()
     return _load(_WORKFLOWS_DIR / "integration.yml")
 

@@ -1,46 +1,111 @@
-# Phase 6 CI wiring addition. This repo's own convention (README, every
-# requirements.txt / docker-compose.yml image tag) is "search first, pin
-# exact versions, re-verify monthly" — done entirely by hand through Phase
-# 5. Dependabot doesn't replace that judgment (a bumped major version still
-# needs a human to read the changelog, same as every "VERSION NOTE" comment
-# already in this repo), but it turns "re-verify monthly" from a thing
-# someone has to remember into a PR that shows up on its own.
-#
-# Four ecosystems, matching the repo's four places a version gets pinned:
-# the gateway's own requirements.txt, mock-providers' separate
-# requirements.txt (deliberately its own dependency set — see that file's
-# header), the two Dockerfiles' base images, and the GitHub Actions
-# workflows this Phase 6 delivery just added.
+# Strategy: "Search first, pin exact versions, re-verify monthly".
+# Dependabot automates update discovery while preserving human oversight on changelogs.
+
 version: 2
 updates:
+  # ---------------------------------------------------------------------------
+  # 1. Gateway Core Dependencies (pip)
+  # ---------------------------------------------------------------------------
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
       interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Kolkata"
     open-pull-requests-limit: 5
-    labels: ["dependencies", "gateway"]
+    labels:
+      - "dependencies"
+      - "gateway"
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    rebase-strategy: "auto"
+    groups:
+      python-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
 
+  # ---------------------------------------------------------------------------
+  # 2. Mock Providers Service (pip)
+  # ---------------------------------------------------------------------------
   - package-ecosystem: "pip"
     directory: "/deploy/mock-providers"
     schedule:
       interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Kolkata"
     open-pull-requests-limit: 5
-    labels: ["dependencies", "mock-providers"]
+    labels:
+      - "dependencies"
+      - "mock-providers"
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    rebase-strategy: "auto"
+    groups:
+      mock-providers-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
 
+  # ---------------------------------------------------------------------------
+  # 3. Root Docker Base Images
+  # ---------------------------------------------------------------------------
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
       interval: "weekly"
-    labels: ["dependencies", "docker"]
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Kolkata"
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "chore(docker)"
+    rebase-strategy: "auto"
 
+  # ---------------------------------------------------------------------------
+  # 4. Mock Providers Docker Base Images
+  # ---------------------------------------------------------------------------
   - package-ecosystem: "docker"
     directory: "/deploy/mock-providers"
     schedule:
       interval: "weekly"
-    labels: ["dependencies", "docker"]
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Kolkata"
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "chore(docker)"
+    rebase-strategy: "auto"
 
+  # ---------------------------------------------------------------------------
+  # 5. GitHub Actions Workflows
+  # ---------------------------------------------------------------------------
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
-    labels: ["dependencies", "ci"]
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Kolkata"
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "ci(deps)"
+    rebase-strategy: "auto"
+    groups:
+      actions:
+        patterns:
+          - "*"

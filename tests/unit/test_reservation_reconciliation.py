@@ -82,7 +82,10 @@ def test_no_refund_and_no_crash_when_actual_usage_exceeds_the_reservation(client
         headers={"X-Gateway-API-Key": DATA_SCIENCE_KEY},
     )
     assert resp.status_code == 200
-    assert _remaining_tpm(client, admin_headers) == 994
+    # The data-science system prompt is included in the reservation estimate:
+    # 19 input tokens + 5 requested output tokens. Actual usage exceeds it,
+    # so reconciliation must not refund any of the 24 reserved tokens.
+    assert _remaining_tpm(client, admin_headers) == 976
 
 
 async def test_streaming_reservation_is_reconciled_against_the_terminal_usage_chunk(

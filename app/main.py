@@ -23,9 +23,24 @@ Phase 3 adds to the lifespan:
   pattern: created with `asyncio.create_task` in the lifespan, cancelled
   and awaited in the `finally` block on shutdown.
 
+Phase 9a adds `TiersConfigStore`/`PricingStore`, the RCU-pattern hot-reload
+stores for config/tiers.yaml and config/pricing.yaml (see those modules'
+own docstrings for why they're a different shape than TeamConfigStore's
+per-key cache), plus their own pub/sub refresh listeners.
+
+Phase 9b adds the two-layer exact/semantic response cache
+(docs/PHASE9B_KICKOFF_SCOPING.md Sec 6/11): `FastEmbedProvider`,
+`ExactMatchCache`, `SemanticCache`, composed into one `CacheGateway` on
+`app.state.cache_gateway`, plus an optional background `CacheSweeper`
+task started only when caching is enabled. See the inline comment at its
+construction site below for why it's built unconditionally regardless of
+`settings.cache_enabled`.
+
 GET /readyz is unchanged — it was already checking the one dependency
-(Redis) everything in this file depends on; Phase 3 doesn't add a new
-external dependency to check.
+(Redis) everything in this file depends on; no phase since has added a
+new external dependency to check (FastEmbed's model download is lazy,
+on first cache lookup, not at boot -- see embedding.py's own docstring
+for why, and why that's a deliberate, not accidental, choice).
 """
 
 from __future__ import annotations
@@ -42,6 +57,11 @@ from redis.asyncio import Redis
 
 from app.api.admin import router as admin_router
 from app.api.v1_chat import router as v1_chat_router
+from app.caching.cache_gateway import CacheGateway
+from app.caching.embedding import FastEmbedProvider
+from app.caching.exact_cache import ExactMatchCache
+from app.caching.semantic_cache import SemanticCache
+from app.caching.sweep import CacheSweeper
 from app.core.audit import AuditLog
 from app.core.config import get_gateway_settings, load_orgs_config, load_teams_config, load_tiers_config
 from app.core.org_store import OrgConfigStore
@@ -245,6 +265,47 @@ def _build_lifespan(redis_client_override: Redis | None):
             pricing_table=app.state.pricing,
         )
 
+        # -- Phase 9b: semantic response cache -------------------------------
+        # See docs/PHASE9B_KICKOFF_SCOPING.md Sec 6/11. `cache_gateway` is
+        # ALWAYS constructed here, regardless of `settings.cache_enabled` --
+        # CacheGateway's own eligibility gate (app/caching/cache_gateway.py)
+        # already checks that flag (and TeamConfig.semantic_cache_enabled)
+        # on every call and returns "ineligible" without touching Redis or
+        # the embedder when caching is off. Two independent on/off switches
+        # for the same feature -- this attribute being None vs. the settings
+        # flag -- would be a second, redundant source of truth; settings.
+        # cache_enabled stays the only one that matters. The
+        # `getattr(state, "cache_gateway", None)` guards at the
+        # v1_chat.py/admin.py call sites exist purely as defensive
+        # robustness for an app.state assembled without this lifespan at
+        # all (e.g. a narrow test harness), not as this feature's real
+        # on/off mechanism.
+        #
+        # FastEmbedProvider's model load is LAZY (first cache lookup, not
+        # here) -- see embedding.py's own docstring: the ONNX weights
+        # download from Hugging Face on first use, and failing that at
+        # boot would make a transient or restricted-egress network hiccup
+        # take the whole gateway process down over a feature that's
+        # supposed to be a pure optimization. CacheGateway's own fail-open
+        # wrapper (see cache_gateway.py) is what actually absorbs a load
+        # failure when it happens, not this constructor.
+        embedding_provider = FastEmbedProvider(
+            model_name=settings.embedding_model, dimension=settings.embedding_dimension
+        )
+        app.state.exact_cache = ExactMatchCache(redis_client, ttl_seconds=settings.cache_ttl_seconds)
+        app.state.semantic_cache = SemanticCache(
+            redis_client,
+            ttl_seconds=settings.cache_ttl_seconds,
+            similarity_threshold=settings.cache_similarity_threshold,
+            max_entries_per_scope=settings.cache_max_entries_per_scope,
+        )
+        app.state.cache_gateway = CacheGateway(
+            exact_cache=app.state.exact_cache,
+            semantic_cache=app.state.semantic_cache,
+            embedding_provider=embedding_provider,
+            settings=settings,
+        )
+
         seeded = await app.state.team_store.seed_from_yaml_if_empty(load_teams_config())
         if seeded:
             logger.info("bootstrap-seeded %d teams into Redis from config/teams.yaml", seeded)
@@ -297,6 +358,18 @@ def _build_lifespan(redis_client_override: Redis | None):
         else:
             logger.info("HEALTH_CHECK_ENABLED=false — active health probing is disabled")
 
+        # Phase 9b: optional memory-hygiene sweep (app/caching/sweep.py) --
+        # only worth running when caching is actually on; NOT a correctness
+        # dependency either way (SemanticCache.get() already self-heals a
+        # stale entry lazily the moment it's next looked up — see that
+        # module's own docstring).
+        cache_sweeper_task: asyncio.Task | None = None
+        if settings.cache_enabled:
+            cache_sweeper = CacheSweeper(redis_client, interval_seconds=300.0)
+            cache_sweeper_task = asyncio.create_task(cache_sweeper.run_forever())
+        else:
+            logger.info("CACHE_ENABLED=false — the cache sweeper background task is not started")
+
         try:
             yield
         finally:
@@ -316,6 +389,10 @@ def _build_lifespan(redis_client_override: Redis | None):
                 health_checker_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await health_checker_task
+            if cache_sweeper_task is not None:
+                cache_sweeper_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await cache_sweeper_task
             # Flush any batched-but-not-yet-exported spans before the
             # process/test tears down. A no-op when nothing was ever
             # added as a processor (otlp_endpoint unset AND no test
@@ -339,12 +416,12 @@ def create_app(*, redis_client: Redis | None = None, span_exporter_override=None
 
     app = FastAPI(
         title="LLM Gateway",
-        version="0.4.0",
+        version="0.5.0",
         description=(
             "Multi-provider LLM API gateway: unified schema, rate limiting, "
-            "fallback routing, and observability. Phase 4: OpenTelemetry "
-            "distributed tracing, Prometheus metrics, and alert rules on top "
-            "of Phase 3's tier-based fallback chains and circuit breakers."
+            "fallback routing, and observability on top of Phase 3's tier-based "
+            "fallback chains and circuit breakers, Phase 9a's config hot-reload, "
+            "and Phase 9b's two-layer exact/semantic response cache."
         ),
         lifespan=_build_lifespan(redis_client),
     )
@@ -399,5 +476,6 @@ def create_app(*, redis_client: Redis | None = None, span_exporter_override=None
         return Response(content=payload, media_type=CONTENT_TYPE_LATEST)
 
     return app
+
 
 app = create_app()

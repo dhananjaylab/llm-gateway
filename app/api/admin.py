@@ -34,6 +34,17 @@ unconfigured providers silently skipped — see
 app/providers/registry.py::all_configured_provider_models), not on
 whatever a client happened to request recently, so an admin can see a
 provider's state even if nothing has called it yet this process lifetime.
+
+Phase 9b addition: the semantic-cache admin surface
+(docs/PHASE9B_KICKOFF_SCOPING.md Sec 7). No new route for the team-level
+toggle itself -- `TeamLimitsPatch` gained one optional field,
+`semantic_cache_enabled`, which already round-trips through the existing
+PATCH /admin/limits/{team_id} below via TeamConfigStore.update_team()'s
+generic model_copy(update=patch) (see app/core/config.py's own note on
+why this field is top-level, not nested under `policy`). What IS new:
+GET /admin/cache/stats/{team_id} (read-only visibility) and
+POST /admin/cache/purge/{team_id} (the incident-response path -- "ship
+rollback fast if something breaks").
 """
 
 from __future__ import annotations
@@ -84,11 +95,19 @@ class TeamLimitsView(BaseModel):
     tpm_cap: int
     remaining_rpm: int
     remaining_tpm: int
+    # Phase 9b: surfaced here (not a separate view) because it's PATCHable
+    # through this same route -- see TeamLimitsPatch below.
+    semantic_cache_enabled: bool
 
 
 class TeamLimitsPatch(BaseModel):
     rpm_cap: int | None = Field(default=None, gt=0)
     tpm_cap: int | None = Field(default=None, gt=0)
+    # Phase 9b: docs/PHASE9B_KICKOFF_SCOPING.md Sec 5.1/7. Round-trips
+    # through update_team()'s existing generic model_copy(update=patch)
+    # for free because TeamConfig.semantic_cache_enabled is a top-level
+    # field, not nested under `policy`.
+    semantic_cache_enabled: bool | None = Field(default=None)
 
 
 async def _limits_view(team_id: str, team, request: Request) -> TeamLimitsView:
@@ -99,6 +118,7 @@ async def _limits_view(team_id: str, team, request: Request) -> TeamLimitsView:
         tpm_cap=team.tpm_cap,
         remaining_rpm=peek.remaining_rpm or 0,
         remaining_tpm=peek.remaining_tpm or 0,
+        semantic_cache_enabled=team.semantic_cache_enabled,
     )
 
 
@@ -134,8 +154,16 @@ async def patch_limits(
         actor=actor,
         action="patch_limits",
         team_id=team_id,
-        before={"rpm_cap": before.rpm_cap, "tpm_cap": before.tpm_cap},
-        after={"rpm_cap": after.rpm_cap, "tpm_cap": after.tpm_cap},
+        before={
+            "rpm_cap": before.rpm_cap,
+            "tpm_cap": before.tpm_cap,
+            "semantic_cache_enabled": before.semantic_cache_enabled,
+        },
+        after={
+            "rpm_cap": after.rpm_cap,
+            "tpm_cap": after.tpm_cap,
+            "semantic_cache_enabled": after.semantic_cache_enabled,
+        },
     )
 
     return await _limits_view(team_id, after, request)
@@ -522,3 +550,94 @@ async def get_circuits(request: Request, actor: str = Depends(require_admin)) ->
         )
         for s in statuses
     ]
+
+
+# -- Phase 9b: semantic response cache admin surface -------------------------
+#
+# See module docstring. No new route for the team-level toggle itself --
+# TeamLimitsPatch above already handles it. What's new: read-only
+# visibility and the incident-response purge path.
+
+
+class CacheScopeView(BaseModel):
+    requested_model: str
+    scope: str
+    exact_entries: int
+    semantic_entries: int
+
+
+class CacheStatsView(BaseModel):
+    team_id: str
+    cache_enabled_globally: bool
+    cache_enabled_for_team: bool
+    scopes: list[CacheScopeView]
+
+
+@router.get("/cache/stats/{team_id}", response_model=CacheStatsView)
+async def get_cache_stats(team_id: str, request: Request, actor: str = Depends(require_admin)) -> CacheStatsView:
+    team = await request.app.state.team_store.get_team(team_id)
+    if team is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"error": {"type": "team_not_found"}})
+
+    settings = get_gateway_settings()
+    redis = request.app.state.redis
+    from app.caching.fingerprint import scope as _scope
+
+    scopes: list[CacheScopeView] = []
+    for model_id in team.allowed_models:
+        s = _scope(team=team, requested_model=model_id)
+        exact_entries = await redis.hlen(f"cache:exact:{s}")
+        semantic_entries = int(await redis.get(f"cache:sem:{s}:count") or 0)
+        scopes.append(
+            CacheScopeView(
+                requested_model=model_id, scope=s, exact_entries=exact_entries, semantic_entries=semantic_entries
+            )
+        )
+
+    return CacheStatsView(
+        team_id=team_id,
+        cache_enabled_globally=settings.cache_enabled,
+        cache_enabled_for_team=team.semantic_cache_enabled,
+        scopes=scopes,
+    )
+
+
+class CachePurgeResult(BaseModel):
+    team_id: str
+    purged_scopes: int
+
+
+@router.post("/cache/purge/{team_id}", response_model=CachePurgeResult)
+async def purge_cache(team_id: str, request: Request, actor: str = Depends(require_admin)) -> CachePurgeResult:
+    """The incident-response path (docs/PHASE9B_KICKOFF_SCOPING.md Sec 9
+    point 6): "ship rollback fast if something breaks" -- an operator who
+    just discovered a bad cached answer should not need a deploy to clear
+    it. Purges every scope the team could plausibly have written to, one
+    per currently-allowed model (scope is keyed on (team, requested_model,
+    policy) -- see app/caching/fingerprint.py)."""
+    team = await request.app.state.team_store.get_team(team_id)
+    if team is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"error": {"type": "team_not_found"}})
+
+    cache_gateway = getattr(request.app.state, "cache_gateway", None)
+    if cache_gateway is None:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": {
+                    "type": "cache_disabled",
+                    "message": "Semantic caching is not wired on this gateway instance.",
+                }
+            },
+        )
+
+    await cache_gateway.purge_team(team=team, requested_models=team.allowed_models)
+
+    await request.app.state.audit_log.record(
+        actor=actor,
+        action="purge_cache",
+        team_id=team_id,
+        before=None,
+        after={"purged_scopes": len(team.allowed_models)},
+    )
+    return CachePurgeResult(team_id=team_id, purged_scopes=len(team.allowed_models))

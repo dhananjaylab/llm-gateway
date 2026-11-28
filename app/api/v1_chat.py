@@ -55,6 +55,63 @@ VERSION NOTE (unchanged from Phase 1): still a hand-formatted
 `StreamingResponse`, not `fastapi.sse.EventSourceResponse` — see the
 original Phase 1 reasoning preserved in git history; nothing about
 Phase 3/4 changes that trade-off.
+
+PHASE 9B ADDITIONS -- READ BEFORE TOUCHING THE TOP OF chat_completions():
+Two-layer response cache (app/caching/*) checked between auth and
+rate-limit/budget consumption. Two structural changes from Phase 1-9a,
+both deliberate, both covered in docs/PHASE9B_KICKOFF_SCOPING.md:
+
+1. `apply_policy(request, team)` now runs INSIDE the existing
+   "auth.rate_limit_check" span, immediately after `enforce_model_allowed`
+   -- i.e. earlier than Phase 1-9a, which ran it AFTER the whole rate-
+   limit/budget block. This is so the cache key and any cached response
+   body are always derived from the REDACTED text, never the raw one
+   (Sec 2). `enforce_model_allowed` deliberately stays exactly where it
+   was, first thing inside the span, so a disallowed-model 403 still
+   reports on "auth.rate_limit_check" exactly as
+   test_span_attributes.py's
+   test_internal_auth_span_reports_error_on_a_403_model_not_allowed
+   already asserts -- that test needed zero changes.
+2. The cache lookup itself is a CHILD span ("cache.lookup") NESTED inside
+   "auth.rate_limit_check", not a sibling span before it -- a refinement
+   made during implementation, not the kickoff doc's literal proposal:
+   nesting means every existing span-shape assertion for
+   "auth.rate_limit_check" (the 403 case above, and the successful-request
+   case in test_internal_auth_span_wraps_every_successful_request) keeps
+   passing completely unchanged, while still achieving Sec 2's actual
+   goal -- the cache lookup runs, and can short-circuit the whole request,
+   before any rate-limit/budget capacity is ever touched. See Sec 9 for
+   the attribute schema this span carries.
+
+On a cache HIT, the function returns immediately from inside these nested
+`with` blocks -- ordinary, well-supported Python; both spans close
+normally (not as an error) since this is a return, not a raise. No CLIENT
+span is emitted for a hit, mirroring the exact rule
+app/resilience/fallback.py already applies to a skipped, open-circuit
+call: Kind=CLIENT means an actual outbound call happened, and a cache hit
+means it deliberately didn't.
+
+On a cache MISS, `estimated_tokens` is now computed from `enriched_request`
+(the redacted text), not the raw `request` -- a small, incidental
+correction that falls out of computing it after redaction instead of
+before: redaction can change text length (PII replaced with a shorter
+placeholder), so estimating off the text that's actually sent to the
+provider is strictly more accurate than before.
+
+After a successful, non-streaming completion, `cache_gateway.write_through()`
+is called unconditionally (a direct `await`, not a background task, per
+this project's own "start simple" posture) -- eligibility AND
+`finish_reason == "stop"` are both re-checked inside `write_through()`
+itself, so this call site doesn't need to duplicate that logic, and a
+future call site can't accidentally skip it either.
+
+`cache_gateway` is read via `getattr(app_state, "cache_gateway", None)`
+rather than a direct attribute access -- defensive robustness for any
+app.state built without the full lifespan (a narrow test harness, e.g.),
+not this feature's actual on/off switch: the real on/off switch is
+`GatewaySettings.cache_enabled` / `TeamConfig.semantic_cache_enabled`,
+both checked inside `CacheGateway` itself. See app/main.py's own note on
+why `cache_gateway` is unconditionally constructed there.
 """
 
 from __future__ import annotations
@@ -66,6 +123,7 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
 
+from app.caching.cache_gateway import CacheGateway
 from app.core.auth import enforce_model_allowed, resolve_team
 from app.core.config import OrgConfig, TeamConfig
 from app.core.policy import apply_policy
@@ -190,6 +248,7 @@ async def chat_completions(
     pricing_table = app_state.pricing
     fallback_router = app_state.fallback_router
     org_store = app_state.org_store
+    cache_gateway: CacheGateway | None = getattr(app_state, "cache_gateway", None)
 
     request_start = time.perf_counter()
     # Best-effort labels for the outer requests_total/duration recording
@@ -215,17 +274,74 @@ async def chat_completions(
         ):
             enforce_model_allowed(team, request.model)
 
-            # -- stage 4a+4b: budget + rate limit -----------------------------
-            estimated_tokens = estimate_reserved_tokens(request)
+            # Phase 9b: policy injection now runs HERE -- see module
+            # docstring's "PHASE 9B ADDITIONS" section for why this moved
+            # earlier than Phase 1-9a, and why enforce_model_allowed
+            # deliberately did NOT move.
+            enriched_request = apply_policy(request, team)
 
-            # -- Phase 8, Option A: org-level quota check, evaluated BEFORE
-            # the team-level check below -- an org-wide block should never
-            # let a request reach (and partially consume) team-level
-            # capacity it was never going to be allowed to use. Two Redis
-            # round trips (org, then team) rather than Phase 7's single
-            # combined one for team alone -- org-level enforcement is
-            # additive on top of that already-tested optimization, not a
-            # rewrite of it. See docs/PHASE8_KICKOFF_SCOPING.md §6.
+            # Phase 9b: cache lookup, nested inside this same span -- see
+            # module docstring. A hit returns straight out of here, before
+            # any rate-limit/budget capacity is touched.
+            if cache_gateway is not None:
+                with internal_span(
+                    tracer, "cache.lookup", **{"gen_ai.client.team_id": team.team_id}
+                ) as cache_span:
+                    cache_result = await cache_gateway.lookup(request=enriched_request, team=team)
+                    if cache_span is not None:
+                        cache_span.set_attribute("gen_ai.gateway.cache.layer", cache_result.layer)
+                        if cache_result.scope is not None:
+                            cache_span.set_attribute("gen_ai.gateway.cache.scope", cache_result.scope)
+                        if cache_result.similarity is not None:
+                            cache_span.set_attribute(
+                                "gen_ai.gateway.cache.similarity", cache_result.similarity
+                            )
+
+                    if metrics is not None and cache_result.similarity is not None:
+                        metrics.cache_similarity.labels(team_id=team.team_id).observe(cache_result.similarity)
+                    if metrics is not None:
+                        layer_label = (
+                            f"{cache_result.layer}_hit"
+                            if cache_result.layer in ("exact", "semantic")
+                            else cache_result.layer
+                        )
+                        metrics.cache_requests_total.labels(team_id=team.team_id, layer=layer_label).inc()
+
+                    if cache_result.layer in ("exact", "semantic"):
+                        # No CLIENT span here on purpose -- see fallback.py's
+                        # own identical rule for a circuit-open skip: the
+                        # skip/hit is visible via cache.layer on THIS span
+                        # and the counter above, not a CLIENT span for a
+                        # provider call that never happened.
+                        cached_response = cache_result.response
+                        response.headers["X-Gateway-Cache"] = "hit"
+                        response.headers["X-Gateway-Served-Model"] = (
+                            f"{cached_response.provider}:{cached_response.model_served}"
+                        )
+                        if metrics is not None:
+                            if cache_result.original_cost_usd:
+                                metrics.cache_savings_usd_total.labels(team_id=team.team_id).inc(
+                                    cache_result.original_cost_usd
+                                )
+                            duration_s = time.perf_counter() - request_start
+                            metrics.requests_total.labels(
+                                team_id=team.team_id,
+                                provider=cached_response.provider,
+                                model=cached_response.model_served,
+                                status="200",
+                            ).inc()
+                            metrics.request_duration_seconds.labels(
+                                provider=cached_response.provider,
+                                model=cached_response.model_served,
+                                status="200",
+                            ).observe(duration_s)
+                        return cached_response
+
+            # Phase 9b: estimated off enriched_request (the redacted text
+            # actually sent onward), not the raw request -- see module
+            # docstring's note on this incidental accuracy improvement.
+            estimated_tokens = estimate_reserved_tokens(enriched_request)
+
             org = await org_store.get_org(team.org_id)
             if org is None:
                 logger.warning(
@@ -251,12 +367,6 @@ async def chat_completions(
 
                 if not org_budget_decision.allowed:
                     if metrics is not None:
-                        # Reuses the existing team_id-labeled counter (no
-                        # Document-05-diverging metrics schema change this
-                        # phase) -- an org-level denial is not separately
-                        # distinguishable from a team-level one in
-                        # gen_ai_budget_applied_total today; flagged as a
-                        # known limitation, not silently conflated.
                         metrics.budget_applied_total.labels(team_id=team.team_id).inc()
                     raise _org_budget_exceeded_exception(org, org_budget_decision)
 
@@ -348,7 +458,9 @@ async def chat_completions(
         response.headers["X-RateLimit-Remaining-RPM"] = str(rl_decision.remaining_rpm)
         response.headers["X-RateLimit-Remaining-TPM"] = str(rl_decision.remaining_tpm)
 
-        enriched_request = apply_policy(request, team)
+        # Phase 9b: enriched_request was already computed above, before the
+        # cache lookup -- no second apply_policy() call here; policy
+        # injection must only ever run once per request.
 
         # -- stage 6: resolve the request's model/tier into an ordered chain
         # A literal "provider:model" id (Phase 1/2 style) resolves to a
@@ -440,6 +552,18 @@ async def chat_completions(
         # isn't necessarily the one literally named in the request.
         response.headers["X-Gateway-Served-Model"] = f"{adapter.provider_name}:{provider_model}"
 
+        if cache_gateway is not None:
+            # Phase 9b write-through -- see module docstring. write_through()
+            # re-checks eligibility and finish_reason == "stop" defensively
+            # on its own, so this call site doesn't duplicate that logic.
+            await cache_gateway.write_through(
+                request=enriched_request,
+                team=team,
+                response=unified,
+                provider=adapter.provider_name,
+                cost_usd=cost_usd,
+            )
+
         record_token_usage_and_cost(
             metrics,
             team_id=team.team_id,
@@ -513,6 +637,12 @@ async def _reconcile_and_bill_partial(
     (tiktoken for OpenAI, Google's local tokenizer for Gemini, Anthropic's
     own documented heuristic for Anthropic, the project's existing
     heuristic for anything else).
+
+    Note: streaming responses never reach the Phase 9b cache (see
+    app/caching/cache_gateway.py's eligibility gate -- `request.stream`
+    is checked before anything else) -- this function has no cache
+    interaction to add, on either branch, and needed zero changes for
+    Phase 9b.
 
     Returns the `Usage` actually used for accounting (so the caller can
     still record per-token-type Prometheus metrics), or `None` if there
@@ -609,6 +739,10 @@ async def _stream_response(
     same way partial text is, and should feed the same best-effort
     output-token estimate rather than silently under-billing to zero for
     the tool-call portion.
+
+    Phase 9b: unmodified. Streaming requests are ineligible for the cache
+    on both the read and write sides (see app/caching/cache_gateway.py's
+    eligibility gate) -- this function's body has nothing to add.
     """
     start = time.perf_counter()
     first_chunk_logged = False

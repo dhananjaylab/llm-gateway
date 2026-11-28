@@ -15,7 +15,8 @@ Redis key schema (extends Document 05's `team_config:{team_id}` HASH):
     team_config:{team_id}        HASH   team_id, api_key_hash, allowed_models
                                          (JSON), rpm_cap, tpm_cap,
                                          budget_cap_usd, budget_period,
-                                         priority_tier, policy (JSON)
+                                         priority_tier, policy (JSON),
+                                         org_id, semantic_cache_enabled
     team_config:__index__        SET    every known team_id (membership
                                          check for "is Redis empty?" and
                                          enumeration)
@@ -35,6 +36,19 @@ own cache within one message round-trip — no polling, no restart. The
 local cache itself is a short (2s) TTL read-through cache purely to keep
 the hot path (every request calls `get_team`/`team_by_api_key_hash`) off
 a Redis round-trip; it is not the source of truth.
+
+PHASE 9B NOTE -- READ BEFORE ADDING ANOTHER TeamConfig FIELD: a new
+TOP-LEVEL field on TeamConfig (like `semantic_cache_enabled` below) does
+NOT automatically persist or read back from Redis just because it exists
+on the model and `update_team()`'s `model_copy(update=patch)` handles it
+correctly in memory. `_write_team()` persists an EXPLICIT field list (a
+Redis HASH has no schema to introspect), and `_deserialize()` reads an
+equally explicit list back out -- both needed to be taught about
+`semantic_cache_enabled` by hand, the exact same two-sided change Phase
+8's `org_id` needed. `_deserialize()` defaults a missing field to `"0"`
+(off) rather than raising, so every team written before Phase 9b shipped
+reads back with caching off, not a crash -- same backward-compatibility
+shape `org_id`'s `"default-org"` fallback already established.
 """
 
 from __future__ import annotations
@@ -98,6 +112,10 @@ class TeamConfigStore:
                 "priority_tier": team.priority_tier,
                 "policy": team.policy.model_dump_json(),
                 "org_id": team.org_id,
+                # Phase 9b: persisted as an explicit "1"/"0" string rather
+                # than relying on Redis's own (nonexistent) bool type —
+                # see module docstring.
+                "semantic_cache_enabled": "1" if team.semantic_cache_enabled else "0",
             },
         )
         pipe.sadd(_TEAM_IDS_KEY, team.team_id)
@@ -121,6 +139,10 @@ class TeamConfigStore:
             # default via config.py's import, kept local here to avoid a
             # second import just for the one constant.
             org_id=raw.get("org_id") or "default-org",
+            # Phase 9b: same backward-compat shape as org_id above — a
+            # team written before this phase shipped has no such field at
+            # all, and must read back as caching-off, not raise.
+            semantic_cache_enabled=raw.get("semantic_cache_enabled", "0") == "1",
         )
 
     # -- reads -------------------------------------------------------------

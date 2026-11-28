@@ -5,8 +5,9 @@
 # affected, and the auto-fallback status.")
 #
 # Written against the metrics in app/observability/metrics.py --
-# GatewayMetrics' 9 Document-05 metrics plus one flagged addition
-# (gen_ai_budget_utilization_ratio; see that module's docstring for why).
+# GatewayMetrics' 9 Document-05 metrics plus two flagged additions
+# (gen_ai_budget_utilization_ratio from Phase 4; gen_ai_cache_* from
+# Phase 9b -- see that module's docstring for why).
 #
 # THRESHOLDS mirror GatewaySettings' existing Phase 3 defaults, kept as-is
 # per explicit Phase 4 kickoff sign-off ("keep Phase 3's assumed
@@ -145,3 +146,38 @@ groups:
             from this team is being rejected before any provider is ever
             called, until the next budget period rolls over or an admin
             raises the cap via PATCH /admin/budgets/{team_id}.
+
+  # Phase 9b: semantic response cache. See
+  # docs/PHASE9B_KICKOFF_SCOPING.md Sec 8/9 -- this is the "Redis hit
+  # telemetry" mitigation the kickoff doc's own cache-poisoning research
+  # named: a sudden, sustained shift in the hit rate (up OR down) for a
+  # team that has caching on is worth a human glancing at, since it's the
+  # cheapest external signal of either a cache that's gone stale/useless
+  # or one that's matching far more aggressively than expected.
+  - name: llm-gateway-cache
+    rules:
+      - alert: CacheHitRateAnomalous
+        expr: >-
+          (
+            sum by (team_id) (rate(gen_ai_cache_requests_total{layer=~"exact_hit|semantic_hit"}[30m]))
+            /
+            sum by (team_id) (rate(gen_ai_cache_requests_total{layer=~"exact_hit|semantic_hit|miss"}[30m]))
+          )
+          and
+          sum by (team_id) (rate(gen_ai_cache_requests_total{layer=~"exact_hit|semantic_hit|miss"}[30m])) > 0.01
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cache hit rate for team {{ $labels.team_id }} is {{ $value | humanizePercentage }}"
+          description: >-
+            Informational threshold, not a hard pass/fail -- this rule
+            fires on every evaluation for any team with cache-eligible
+            traffic so the current hit rate is always visible in
+            Alertmanager/Slack history; route it to a low-priority channel
+            and watch for a STEP CHANGE from one evaluation to the next,
+            which is the actual signal worth investigating (a sudden jump
+            can mean near-duplicate traffic just started, or -- worth
+            checking first -- a similarity-threshold or isolation-scope
+            regression; see docs/PHASE9B_KICKOFF_SCOPING.md Sec 9's
+            cache-poisoning mitigations).

@@ -33,6 +33,17 @@ Phase 8 addition:
   explicit developer sign-off). `OrgConfigStore` (app/core/org_store.py)
   is the Redis-backed, hot-reloadable runtime store, mirroring
   `TeamConfigStore` exactly.
+Phase 9b addition:
+- `semantic_cache_enabled` on `TeamConfig` (default `False`, top-level —
+  not nested under `TeamPolicy`, deliberately, so it PATCHes for free
+  through the existing generic `TeamConfigStore.update_team()` path; see
+  docs/PHASE9B_KICKOFF_SCOPING.md Sec 5.1). `GatewaySettings` gains a
+  `cache_*` settings group for the two-layer exact/semantic response
+  cache (app/caching/*) — same "safe defaults, env-overridable" shape as
+  every settings group above it. `cache_enabled` is the gateway-level half
+  of the "double opt-in" (Sec 4.3); `TeamConfig.semantic_cache_enabled` is
+  the other half — BOTH must be true for a team's traffic to ever reach
+  the cache.
 """
 
 from __future__ import annotations
@@ -81,6 +92,19 @@ class TeamConfig(BaseModel):
     priority_tier: str = "realtime"
     policy: TeamPolicy = Field(default_factory=TeamPolicy)
     org_id: str = DEFAULT_ORG_ID
+    # Phase 9b: top-level (not nested under `policy`) specifically so it
+    # PATCHes for free through the existing /admin/limits/{team_id} route —
+    # TeamConfigStore.update_team() does a flat model_copy(update=patch),
+    # which only works cleanly against top-level fields (pii_redaction and
+    # system_prompt_prefix, nested under `policy`, aren't PATCHable today
+    # for exactly that reason). See docs/PHASE9B_KICKOFF_SCOPING.md Sec
+    # 5.1 / Sec 7. NOTE, found while implementing: this field ALSO needed
+    # TeamConfigStore._write_team()/._deserialize() to explicitly persist
+    # and read it (Redis HASH fields are listed, not reflective) — the
+    # same thing Phase 8's org_id needed; "top-level" alone doesn't get
+    # you Redis persistence for free, only the PATCH merge for free. See
+    # app/core/team_store.py.
+    semantic_cache_enabled: bool = False
 
 
 class OrgConfig(BaseModel):
@@ -256,7 +280,7 @@ def load_tiers_config(path: str | Path | None = None) -> TiersConfig:
 
 class GatewaySettings(BaseModel):
     """
-    Infrastructure settings. See module docstring for what's new in Phase 3.
+    Infrastructure settings. See module docstring for what's new in each phase.
     """
 
     redis_url: str = "redis://localhost:6379/0"
@@ -380,11 +404,33 @@ class GatewaySettings(BaseModel):
     alert_latency_p99_seconds: float = 5.0  # matches health_degraded_latency_p99_ms
     slack_webhook_url: str | None = None
 
+    # -- Phase 9b: semantic response caching --------------------------------
+    # See docs/PHASE9B_KICKOFF_SCOPING.md Sec 5.2. `cache_enabled` is the
+    # gateway-level half of the "double opt-in" (Sec 4.3);
+    # `TeamConfig.semantic_cache_enabled` above is the other half — both
+    # default off, same safe-by-default posture `otel_capture_message_content`
+    # and every demo team's `pii_redaction` already established.
+    cache_enabled: bool = False
+    cache_exact_match_enabled: bool = True
+    cache_semantic_enabled: bool = True
+    cache_similarity_threshold: float = 0.97
+    cache_max_temperature: float = 0.3
+    cache_ttl_seconds: int = 3600
+    cache_max_entries_per_scope: int = 5000
+    embedding_provider: str = "fastembed"
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    embedding_dimension: int = 384
+
 
 @lru_cache(maxsize=1)
 def get_gateway_settings() -> GatewaySettings:
     return GatewaySettings(
         redis_url=os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
+        redis_socket_timeout_seconds=float(os.environ.get("REDIS_SOCKET_TIMEOUT_SECONDS", "5.0")),
+        redis_socket_connect_timeout_seconds=float(
+            os.environ.get("REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS", "5.0")
+        ),
+        redis_max_connections=int(os.environ.get("REDIS_MAX_CONNECTIONS", "50")),
         gateway_admin_key=os.environ.get("GATEWAY_ADMIN_KEY"),
         rate_limit_fail_open=_env_bool("RATE_LIMIT_FAIL_OPEN", True),
         rate_limit_key_ttl_seconds=int(os.environ.get("RATE_LIMIT_KEY_TTL_SECONDS", "7200")),
@@ -435,6 +481,16 @@ def get_gateway_settings() -> GatewaySettings:
         metrics_enabled=_env_bool("METRICS_ENABLED", True),
         alert_latency_p99_seconds=float(os.environ.get("ALERT_LATENCY_P99_SECONDS", "5.0")),
         slack_webhook_url=os.environ.get("SLACK_WEBHOOK_URL") or None,
+        cache_enabled=_env_bool("CACHE_ENABLED", False),
+        cache_exact_match_enabled=_env_bool("CACHE_EXACT_MATCH_ENABLED", True),
+        cache_semantic_enabled=_env_bool("CACHE_SEMANTIC_ENABLED", True),
+        cache_similarity_threshold=float(os.environ.get("CACHE_SIMILARITY_THRESHOLD", "0.97")),
+        cache_max_temperature=float(os.environ.get("CACHE_MAX_TEMPERATURE", "0.3")),
+        cache_ttl_seconds=int(os.environ.get("CACHE_TTL_SECONDS", "3600")),
+        cache_max_entries_per_scope=int(os.environ.get("CACHE_MAX_ENTRIES_PER_SCOPE", "5000")),
+        embedding_provider=os.environ.get("EMBEDDING_PROVIDER", "fastembed"),
+        embedding_model=os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
+        embedding_dimension=int(os.environ.get("EMBEDDING_DIMENSION", "384")),
     )
 
 

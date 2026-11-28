@@ -37,6 +37,15 @@ that conversion happens; every call site converts through the STATE
 STRING ("closed"/"open"/"half_open") and this function, never through the
 Lua layer's raw int, specifically so this swap can't silently invert in a
 second call site.
+
+PHASE 9B ADDITIONS -- `cache_requests_total`, `cache_similarity`,
+`cache_entries`, `cache_savings_usd_total`. Flagged beyond Document 05's
+original nine (same honesty convention `budget_utilization_ratio` already
+established in Phase 4) -- see docs/PHASE9B_KICKOFF_SCOPING.md Sec 8.
+`cache_similarity` is observed on every semantic-layer lookup ATTEMPT,
+hit or not, deliberately: the whole point is having real-traffic data to
+tune `CACHE_SIMILARITY_THRESHOLD` against later, which only works if
+misses are in the histogram too, not just hits.
 """
 
 from __future__ import annotations
@@ -53,6 +62,11 @@ _REQUEST_DURATION_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5
 # TTFT is streaming-only and sub-second-focused -- finer low-end
 # resolution than the full-request histogram above.
 _TTFT_BUCKETS = (0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 5, 10)
+# Phase 9b: similarity scores live in [0, 1]; finer resolution clustered
+# near the CACHE_SIMILARITY_THRESHOLD default (0.97) is what actually
+# matters for tuning it later against real traffic
+# (docs/PHASE9B_KICKOFF_SCOPING.md Sec 4.2), not an evenly-spread range.
+_CACHE_SIMILARITY_BUCKETS = (0.5, 0.7, 0.8, 0.85, 0.9, 0.93, 0.95, 0.97, 0.98, 0.99, 0.995, 1.0)
 
 # Document 05: "0=Closed, 1=Half-Open, 2=Open" -- see module docstring.
 _CIRCUIT_GAUGE_VALUES = {"closed": 0, "half_open": 1, "open": 2}
@@ -92,6 +106,13 @@ class GatewayMetrics:
     # bookkeeping, just also exporting a number that already existed.
     # See deploy/prometheus/alerts.yml's header for the resulting rule.
     budget_utilization_ratio: Gauge
+    # -- Phase 9b: semantic response caching (flagged additions, same
+    # honesty convention as budget_utilization_ratio above -- see module
+    # docstring and docs/PHASE9B_KICKOFF_SCOPING.md Sec 8) ---------------
+    cache_requests_total: Counter
+    cache_similarity: Histogram
+    cache_entries: Gauge
+    cache_savings_usd_total: Counter
 
 
 def build_metrics(registry: CollectorRegistry | None = None) -> GatewayMetrics:
@@ -159,6 +180,35 @@ def build_metrics(registry: CollectorRegistry | None = None) -> GatewayMetrics:
             "Current spend / cap for a team's active budget period (not one of Document 05's "
             "original 9 -- added to make an 80%-of-budget alert rule expressible; see this "
             "module's docstring).",
+            ["team_id"],
+            registry=registry,
+        ),
+        cache_requests_total=Counter(
+            "gen_ai_cache_requests_total",
+            "Cache-layer outcome per request (Phase 9b): exact_hit, semantic_hit, miss, or "
+            "ineligible. See docs/PHASE9B_KICKOFF_SCOPING.md Sec 8.",
+            ["team_id", "layer"],
+            registry=registry,
+        ),
+        cache_similarity=Histogram(
+            "gen_ai_cache_similarity",
+            "Similarity score observed on every semantic cache lookup attempt, hit or not -- "
+            "recorded regardless of outcome so CACHE_SIMILARITY_THRESHOLD can be tuned against "
+            "real traffic (Phase 9b).",
+            ["team_id"],
+            buckets=_CACHE_SIMILARITY_BUCKETS,
+            registry=registry,
+        ),
+        cache_entries=Gauge(
+            "gen_ai_cache_entries",
+            "Current entry count per team and cache layer (Phase 9b).",
+            ["team_id", "layer"],
+            registry=registry,
+        ),
+        cache_savings_usd_total=Counter(
+            "gen_ai_cache_savings_usd_total",
+            "USD the cached entry originally cost, credited on every cache hit -- the direct "
+            "number for the Business dashboard's savings-from-caching panel (Phase 9b).",
             ["team_id"],
             registry=registry,
         ),
